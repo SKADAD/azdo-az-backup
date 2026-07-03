@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "azdo-az-backup"
+version = "0.1.0"
+description = "Backup and restore Azure DevOps projects and organizations."
+requires-python = ">=3.9"
+dependencies = ["requests>=2.31"]
+
+[project.scripts]
+azdo-backup = "azdo_backup.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["azdo_backup*"]
