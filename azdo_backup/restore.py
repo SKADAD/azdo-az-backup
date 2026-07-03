@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +92,7 @@ def restore_project(
     summary = {"source": str(src), "target_project": new_project_name,
                "target_project_id": new_project.get("id")}
 
+    id_map: dict[int, int] = {}
     if not skip_work_items and (src / "work_items").exists():
         id_map = _restore_work_items(client, new_project_name, src / "work_items")
         with open(src / "id_map.json", "w", encoding="utf-8") as f:
@@ -102,8 +104,7 @@ def restore_project(
 
     if not skip_test_plans and (src / "test_plans").exists():
         summary["test_plans_restored"] = _restore_test_plans(
-            client, new_project_name, src / "test_plans",
-            id_map if not skip_work_items else {},
+            client, new_project_name, src / "test_plans", id_map,
         )
 
     return summary
@@ -144,7 +145,6 @@ def _ensure_project(client: AzDoClient, name: str,
     # Poll the operation until completion.
     op_id = op.get("id") if isinstance(op, dict) else None
     if op_id:
-        import time
         for _ in range(60):
             status = client.get_json(f"_apis/operations/{op_id}")
             if status.get("status") in ("succeeded", "failed", "cancelled"):
@@ -176,7 +176,7 @@ def _restore_work_items(client: AzDoClient, project: str, src: Path) -> dict[int
         if not wit:
             log.warning("[%s] WI %s missing System.WorkItemType, skipping", project, old_id)
             continue
-        patch = _fields_to_patch(fields, skip_relations=True)
+        patch = _fields_to_patch(fields)
         try:
             created = client.patch_json(
                 f"_apis/wit/workitems/${wit}",
@@ -223,7 +223,7 @@ def _restore_work_items(client: AzDoClient, project: str, src: Path) -> dict[int
     return id_map
 
 
-def _fields_to_patch(fields: dict, *, skip_relations: bool) -> list[dict]:
+def _fields_to_patch(fields: dict) -> list[dict]:
     patch: list[dict] = []
     for name, value in fields.items():
         if name in _SKIP_FIELDS:
@@ -235,27 +235,44 @@ def _fields_to_patch(fields: dict, *, skip_relations: bool) -> list[dict]:
     return patch
 
 
+def _find_attachment_file(backup_root: Path, wi: dict, rel: dict) -> Path | None:
+    """Locate the on-disk file for an AttachedFile relation.
+
+    Prefers the exact path recorded in ``attachments_local`` at backup time;
+    falls back to reconstructing it from the sanitized attachment name.
+    """
+    old_id = wi["id"]
+    rel_url = rel.get("url")
+    for meta in wi.get("attachments_local", []) or []:
+        if (meta.get("rel") or {}).get("url") == rel_url:
+            candidate = backup_root / meta["file"]
+            if candidate.exists():
+                return candidate
+    name = (rel.get("attributes") or {}).get("name") or ""
+    attachments_dir = backup_root / "work_items" / "attachments" / str(old_id)
+    candidate = attachments_dir / safe_filename(name)
+    if candidate.exists():
+        return candidate
+    if attachments_dir.exists():
+        candidates = list(attachments_dir.iterdir())
+        if len(candidates) == 1:
+            return candidates[0]
+    return None
+
+
 def _restore_relations(client: AzDoClient, project: str, backup_root: Path,
                        wi: dict, new_id: int, id_map: dict[int, int]) -> None:
     patches: list[dict] = []
     for rel in wi.get("relations", []) or []:
         rel_type = rel.get("rel")
         if rel_type == "AttachedFile":
-            # find the local file we stored and re-upload
             old_id = wi["id"]
-            attachments_dir = backup_root / "work_items" / "attachments" / str(old_id)
             name = (rel.get("attributes") or {}).get("name") or ""
-            local = attachments_dir / safe_filename(name)
-            if not local.exists():
-                # find any file in that dir matching size if exact match missing
-                if attachments_dir.exists():
-                    candidates = list(attachments_dir.iterdir())
-                    if len(candidates) == 1:
-                        local = candidates[0]
-                if not local.exists():
-                    log.warning("[%s] attachment file for WI %s not found locally: %s",
-                                project, old_id, name)
-                    continue
+            local = _find_attachment_file(backup_root, wi, rel)
+            if local is None:
+                log.warning("[%s] attachment file for WI %s not found locally: %s",
+                            project, old_id, name)
+                continue
             try:
                 with open(local, "rb") as f:
                     resp = client.request(
@@ -332,8 +349,9 @@ def _restore_repos(client: AzDoClient, project: str, src: Path) -> int:
         if not remote:
             log.error("[%s] repo '%s' has no remoteUrl after creation", project, name)
             continue
-        push_url = client.repo_clone_url_with_pat(remote)
-        cmd = ["git", "-C", str(repo_dir), "push", "--mirror", push_url]
+        push_url = client.strip_url_credentials(remote)
+        cmd = ["git", *client.git_auth_args(), "-C", str(repo_dir),
+               "push", "--mirror", push_url]
         log.info("[%s] pushing mirror for '%s'", project, name)
         try:
             subprocess.run(cmd, check=True, capture_output=True, text=True)

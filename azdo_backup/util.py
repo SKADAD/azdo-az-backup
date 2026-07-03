@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import os
 import re
@@ -9,22 +11,30 @@ from typing import Callable, TypeVar
 
 T = TypeVar("T")
 
+_ROOT_LOGGER_NAME = "azdo_backup"
 _LOG_INITIALIZED = False
 
 
-def get_logger(name: str = "azdo_backup") -> logging.Logger:
+def get_logger(name: str = _ROOT_LOGGER_NAME) -> logging.Logger:
+    """Return a logger under the package root logger.
+
+    The handler/level live on the root package logger; module loggers
+    (``azdo_backup.client`` etc.) propagate to it so every module logs.
+    """
     global _LOG_INITIALIZED
-    logger = logging.getLogger(name)
     if not _LOG_INITIALIZED:
+        root = logging.getLogger(_ROOT_LOGGER_NAME)
         handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(
             logging.Formatter("%(asctime)s %(levelname)-5s %(name)s: %(message)s")
         )
-        logger.addHandler(handler)
-        logger.setLevel(os.environ.get("AZDO_BACKUP_LOG", "INFO").upper())
-        logger.propagate = False
+        root.addHandler(handler)
+        root.setLevel(os.environ.get("AZDO_BACKUP_LOG", "INFO").upper())
+        root.propagate = False
         _LOG_INITIALIZED = True
-    return logger
+    if name != _ROOT_LOGGER_NAME and not name.startswith(_ROOT_LOGGER_NAME + "."):
+        name = f"{_ROOT_LOGGER_NAME}.{name}"
+    return logging.getLogger(name)
 
 
 def ensure_dir(path: os.PathLike | str) -> Path:

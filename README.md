@@ -127,6 +127,19 @@ Repos are cloned with `git clone --mirror`, so every ref (branches, tags,
 notes) is captured. Re-running a backup against an existing output directory
 performs a `git remote update --prune` instead of re-cloning.
 
+Git authentication uses a per-invocation `http.extraheader` — the PAT is
+**never written into the backup** (not in remote URLs, not in `.git/config`).
+
+## Development
+
+```bash
+python -m pip install -e . pytest
+pytest
+```
+
+CI runs the test suite on Python 3.9 and 3.12 for every push and pull
+request (`.github/workflows/ci.yml`).
+
 ## Logging
 
 Set `AZDO_BACKUP_LOG=DEBUG` to see request-level logs. Failures are
