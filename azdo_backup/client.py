@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import base64
 import os
-from typing import Any, Iterable, Iterator
+import time
+from pathlib import Path
+from typing import Any, Iterator
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -21,7 +23,9 @@ DEFAULT_API_VERSION = "7.1"
 
 
 class AzDoError(RuntimeError):
-    pass
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class AzDoClient:
@@ -93,6 +97,13 @@ class AzDoClient:
             headers=headers, timeout=self.timeout, stream=stream,
         )
         if resp.status_code == 429:
+            # Honor the server's pacing hint before the retry decorator kicks in.
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    time.sleep(min(float(retry_after), 60.0))
+                except ValueError:
+                    pass
             raise requests.RequestException(f"Rate limited: {resp.text[:200]}")
         if resp.status_code >= 500:
             raise requests.RequestException(
@@ -100,7 +111,8 @@ class AzDoClient:
             )
         if resp.status_code >= 400:
             raise AzDoError(
-                f"{method} {url} -> {resp.status_code}: {resp.text[:500]}"
+                f"{method} {url} -> {resp.status_code}: {resp.text[:500]}",
+                status_code=resp.status_code,
             )
         return resp
 
@@ -162,11 +174,19 @@ class AzDoClient:
             params["continuationToken"] = token
 
     def download(self, url: str, dest_path) -> None:
-        with self.request("GET", url, stream=True, api_version=None) as resp:
-            with open(dest_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=64 * 1024):
-                    if chunk:
-                        f.write(chunk)
+        """Stream a binary URL to disk atomically (temp file + rename)."""
+        dest = Path(dest_path)
+        tmp = dest.with_name(dest.name + ".part")
+        try:
+            with self.request("GET", url, stream=True, api_version=None,
+                              headers={"Accept": "application/octet-stream"}) as resp:
+                with open(tmp, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=64 * 1024):
+                        if chunk:
+                            f.write(chunk)
+            tmp.replace(dest)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------ helpers
 

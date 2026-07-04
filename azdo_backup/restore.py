@@ -18,10 +18,11 @@ import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+from urllib.parse import quote
 
 from .client import AzDoClient, AzDoError
-from .util import ensure_dir, get_logger, safe_filename
+from .util import get_logger, run_git, safe_filename
 
 log = get_logger(__name__)
 
@@ -71,7 +72,7 @@ def restore_project(
     source_dir: str | os.PathLike,
     new_project_name: str,
     *,
-    process_template: str = "Agile",
+    process_template: str | None = None,
     source_control_type: str = "Git",
     visibility: str = "private",
     skip_work_items: bool = False,
@@ -85,6 +86,11 @@ def restore_project(
     log.info("Restoring '%s' -> '%s' in org '%s'",
              original.get("name"), new_project_name, client.org_name)
 
+    if not process_template:
+        caps = ((original.get("capabilities") or {}).get("processTemplate") or {})
+        process_template = caps.get("templateName") or "Agile"
+        log.info("Using process template '%s' (from source project)", process_template)
+
     new_project = _ensure_project(client, new_project_name,
                                   process_template=process_template,
                                   source_control_type=source_control_type,
@@ -92,9 +98,12 @@ def restore_project(
     summary = {"source": str(src), "target_project": new_project_name,
                "target_project_id": new_project.get("id")}
 
+    old_project_name = original.get("name") or new_project_name
+
     id_map: dict[int, int] = {}
     if not skip_work_items and (src / "work_items").exists():
-        id_map = _restore_work_items(client, new_project_name, src / "work_items")
+        id_map = _restore_work_items(client, new_project_name, src / "work_items",
+                                     old_project=old_project_name)
         with open(src / "id_map.json", "w", encoding="utf-8") as f:
             json.dump(id_map, f, indent=2)
         summary["work_items_mapped"] = len(id_map)
@@ -105,6 +114,7 @@ def restore_project(
     if not skip_test_plans and (src / "test_plans").exists():
         summary["test_plans_restored"] = _restore_test_plans(
             client, new_project_name, src / "test_plans", id_map,
+            old_project=old_project_name,
         )
 
     return summary
@@ -120,8 +130,11 @@ def _ensure_project(client: AzDoClient, name: str,
         existing = client.get_project(name)
         log.info("Project '%s' already exists, reusing", name)
         return existing
-    except AzDoError:
-        pass
+    except AzDoError as exc:
+        # Only a 404 means "project doesn't exist"; auth or permission
+        # failures must not silently fall through to project creation.
+        if exc.status_code != 404:
+            raise
 
     processes = client.get_json("_apis/process/processes").get("value", [])
     process = next((p for p in processes if p["name"].lower() == process_template.lower()), None)
@@ -145,23 +158,87 @@ def _ensure_project(client: AzDoClient, name: str,
     # Poll the operation until completion.
     op_id = op.get("id") if isinstance(op, dict) else None
     if op_id:
-        for _ in range(60):
+        for _ in range(90):
             status = client.get_json(f"_apis/operations/{op_id}")
             if status.get("status") in ("succeeded", "failed", "cancelled"):
                 if status["status"] != "succeeded":
                     raise AzDoError(f"Project creation {status['status']}: {status}")
                 break
             time.sleep(2)
+        else:
+            raise AzDoError(f"Project creation still running after 180s (operation {op_id})")
     return client.get_project(name)
+
+
+# --------------------------------------------------------------------- classification
+
+
+def remap_classification_path(path: str | None, old_project: str,
+                              new_project: str) -> str | None:
+    """Re-root ``OldProject\\Area\\Sub`` under the new project name."""
+    if not path:
+        return path
+    parts = path.split("\\")
+    if parts and parts[0].strip().lower() == old_project.strip().lower():
+        parts[0] = new_project
+        return "\\".join(parts)
+    return path
+
+
+def _ensure_classification_nodes(client: AzDoClient, project: str,
+                                 group: str, paths: Iterable[str]) -> None:
+    """Create area/iteration nodes so remapped paths validate on the server.
+
+    ``group`` is ``areas`` or ``iterations``. Paths must already be re-rooted
+    under the target project name; the root node always exists.
+    """
+    created: set[str] = set()
+    for path in sorted(set(p for p in paths if p)):
+        parts = path.split("\\")
+        for depth in range(1, len(parts)):
+            node_path = "\\".join(parts[: depth + 1])
+            if node_path in created:
+                continue
+            url = f"_apis/wit/classificationnodes/{group}"
+            if depth > 1:
+                url += "/" + "/".join(quote(seg, safe="") for seg in parts[1:depth])
+            try:
+                client.post_json(url, {"name": parts[depth]}, project=project)
+            except AzDoError as exc:
+                text = str(exc).lower()
+                if exc.status_code != 409 and "already exists" not in text \
+                        and "vs402371" not in text:
+                    log.warning("[%s] create %s node '%s' failed: %s",
+                                project, group, node_path, exc)
+            created.add(node_path)
 
 
 # --------------------------------------------------------------------- work items
 
 
-def _restore_work_items(client: AzDoClient, project: str, src: Path) -> dict[int, int]:
+def _restore_work_items(client: AzDoClient, project: str, src: Path,
+                        *, old_project: str) -> dict[int, int]:
     idx = _read_json(src / "index.json")
     ids = idx["ids"]
     log.info("[%s] restoring %d work items", project, len(ids))
+
+    # Pass 0: recreate the area/iteration tree the items reference, so field
+    # values validate. Paths are re-rooted from the old project name.
+    area_paths: set[str] = set()
+    iteration_paths: set[str] = set()
+    for old_id in ids:
+        path = src / f"{old_id}.json"
+        if not path.exists():
+            continue
+        fields = _read_json(path).get("fields") or {}
+        ap = remap_classification_path(fields.get("System.AreaPath"), old_project, project)
+        ip = remap_classification_path(fields.get("System.IterationPath"), old_project, project)
+        if ap:
+            area_paths.add(ap)
+        if ip:
+            iteration_paths.add(ip)
+    _ensure_classification_nodes(client, project, "areas", area_paths)
+    _ensure_classification_nodes(client, project, "iterations", iteration_paths)
 
     id_map: dict[int, int] = {}
 
@@ -176,7 +253,7 @@ def _restore_work_items(client: AzDoClient, project: str, src: Path) -> dict[int
         if not wit:
             log.warning("[%s] WI %s missing System.WorkItemType, skipping", project, old_id)
             continue
-        patch = _fields_to_patch(fields)
+        patch = _fields_to_patch(fields, old_project=old_project, new_project=project)
         try:
             created = client.patch_json(
                 f"_apis/wit/workitems/${wit}",
@@ -223,7 +300,8 @@ def _restore_work_items(client: AzDoClient, project: str, src: Path) -> dict[int
     return id_map
 
 
-def _fields_to_patch(fields: dict) -> list[dict]:
+def _fields_to_patch(fields: dict, *, old_project: str | None = None,
+                     new_project: str | None = None) -> list[dict]:
     patch: list[dict] = []
     for name, value in fields.items():
         if name in _SKIP_FIELDS:
@@ -231,6 +309,9 @@ def _fields_to_patch(fields: dict) -> list[dict]:
         # Server-managed identity objects need their displayName/uniqueName form.
         if isinstance(value, dict) and "uniqueName" in value:
             value = value.get("uniqueName") or value.get("displayName")
+        if name in ("System.AreaPath", "System.IterationPath") \
+                and old_project and new_project:
+            value = remap_classification_path(value, old_project, new_project)
         patch.append({"op": "add", "path": f"/fields/{name}", "value": value})
     return patch
 
@@ -303,6 +384,14 @@ def _restore_relations(client: AzDoClient, project: str, backup_root: Path,
             target_new = id_map.get(target_old)
             if not target_new:
                 continue
+            # Each link appears on both endpoints; adding it twice makes the
+            # second PATCH fail. Recreate directional links only from the
+            # Forward side, and symmetric links (e.g. Related) only from the
+            # endpoint with the lower original ID.
+            if rel_type.endswith("-Reverse"):
+                continue
+            if not rel_type.endswith("-Forward") and wi["id"] > target_old:
+                continue
             patches.append({
                 "op": "add", "path": "/relations/-",
                 "value": {
@@ -317,11 +406,24 @@ def _restore_relations(client: AzDoClient, project: str, backup_root: Path,
                 "value": {"rel": "Hyperlink", "url": rel.get("url"),
                           "attributes": rel.get("attributes") or {}},
             })
-    if patches:
+    if not patches:
+        return
+    try:
         client.patch_json(
             f"_apis/wit/workitems/{new_id}", patches, project=project,
             params={"bypassRules": "true", "suppressNotifications": "true"},
         )
+    except AzDoError:
+        # One bad relation must not take the rest down — apply individually.
+        for p in patches:
+            try:
+                client.patch_json(
+                    f"_apis/wit/workitems/{new_id}", [p], project=project,
+                    params={"bypassRules": "true", "suppressNotifications": "true"},
+                )
+            except AzDoError as exc:
+                log.error("[%s] relation %s on WI %s failed: %s",
+                          project, (p.get("value") or {}).get("rel"), new_id, exc)
 
 
 # --------------------------------------------------------------------- repos
@@ -350,11 +452,15 @@ def _restore_repos(client: AzDoClient, project: str, src: Path) -> int:
             log.error("[%s] repo '%s' has no remoteUrl after creation", project, name)
             continue
         push_url = client.strip_url_credentials(remote)
+        # Push branches and tags explicitly rather than --mirror: mirrors of
+        # Azure DevOps repos carry server-managed hidden refs (refs/pull/*)
+        # that the target server rejects, failing the whole push.
         cmd = ["git", *client.git_auth_args(), "-C", str(repo_dir),
-               "push", "--mirror", push_url]
-        log.info("[%s] pushing mirror for '%s'", project, name)
+               "push", push_url,
+               "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]
+        log.info("[%s] pushing branches/tags for '%s'", project, name)
         try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            run_git(cmd, check=True)
             pushed += 1
         except subprocess.CalledProcessError as exc:
             log.error("[%s] push '%s' failed: %s", project, name,
@@ -366,7 +472,7 @@ def _restore_repos(client: AzDoClient, project: str, src: Path) -> int:
 
 
 def _restore_test_plans(client: AzDoClient, project: str, src: Path,
-                        wi_id_map: dict[int, int]) -> int:
+                        wi_id_map: dict[int, int], *, old_project: str) -> int:
     if not (src / "index.json").exists():
         return 0
     plans = _read_json(src / "index.json").get("plans", [])
@@ -378,8 +484,10 @@ def _restore_test_plans(client: AzDoClient, project: str, src: Path,
         body = {
             "name": plan.get("name"),
             "description": plan.get("description"),
-            "areaPath": plan.get("areaPath"),
-            "iteration": plan.get("iteration"),
+            "areaPath": remap_classification_path(plan.get("areaPath"),
+                                                  old_project, project),
+            "iteration": remap_classification_path(plan.get("iteration"),
+                                                   old_project, project),
             "startDate": plan.get("startDate"),
             "endDate": plan.get("endDate"),
         }
@@ -429,13 +537,24 @@ def _restore_test_plans(client: AzDoClient, project: str, src: Path,
                     continue  # root
                 parent_old = (s.get("parentSuite") or {}).get("id")
                 parent_new = suite_id_map.get(parent_old) or root_suite
+                suite_type = s.get("suiteType", "staticTestSuite")
                 suite_body = {
                     "name": s.get("name"),
-                    "suiteType": s.get("suiteType", "StaticTestSuite"),
+                    "suiteType": suite_type,
                     "parentSuite": {"id": parent_new},
                 }
                 if s.get("queryString"):
                     suite_body["queryString"] = s["queryString"]
+                if suite_type.lower() == "requirementtestsuite":
+                    req_old = s.get("requirementId")
+                    req_new = wi_id_map.get(req_old)
+                    if not req_new:
+                        log.warning(
+                            "[%s] suite '%s': requirement WI %s not in id map, "
+                            "recreating as a static suite", project, s.get("name"), req_old)
+                        suite_body["suiteType"] = "staticTestSuite"
+                    else:
+                        suite_body["requirementId"] = req_new
                 try:
                     new_s = client.post_json(
                         f"_apis/testplan/Plans/{new_plan_id}/suites",

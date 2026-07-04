@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 from functools import wraps
@@ -80,6 +81,14 @@ def retry(
                     time.sleep(delay)
         return wrapper
     return deco
+
+
+def run_git(cmd: list[str], check: bool = False) -> "subprocess.CompletedProcess[str]":
+    """Run a git command non-interactively (never prompt for credentials)."""
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = "true"  # the no-op /usr/bin/true: fail instead of prompting
+    return subprocess.run(cmd, check=check, capture_output=True, text=True, env=env)
 
 
 def chunks(seq, size: int):

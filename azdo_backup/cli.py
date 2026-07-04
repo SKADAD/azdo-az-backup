@@ -43,8 +43,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Path to a backed-up project directory (the one containing project.json).")
     r.add_argument("--project", required=True,
                    help="Target project name to create / restore into.")
-    r.add_argument("--process", default="Agile",
-                   help="Process template for the new project (default: Agile).")
+    r.add_argument("--process", default=None,
+                   help="Process template for the new project "
+                        "(default: the source project's process, else Agile).")
     r.add_argument("--visibility", default="private", choices=["private", "public"])
     r.add_argument("--skip-work-items", action="store_true")
     r.add_argument("--skip-repos", action="store_true")
