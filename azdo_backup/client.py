@@ -41,10 +41,10 @@ class AzDoClient:
                 "No PAT supplied. Pass --pat or set AZURE_DEVOPS_EXT_PAT."
             )
         self.timeout = timeout
-        token = base64.b64encode(f":{self.pat}".encode()).decode()
+        self._basic_token = base64.b64encode(f":{self.pat}".encode()).decode()
         self.session = requests.Session()
         self.session.headers.update({
-            "Authorization": f"Basic {token}",
+            "Authorization": f"Basic {self._basic_token}",
             "Accept": "application/json",
         })
 
@@ -141,6 +141,26 @@ class AzDoClient:
                 return
             skip += len(items)
 
+    def iter_continuation(self, path: str, *, project: str | None = None,
+                          params: dict | None = None, value_key: str = "value",
+                          api_version: str | None = DEFAULT_API_VERSION) -> Iterator[dict]:
+        """Iterate a list endpoint paginated via ``x-ms-continuationtoken``.
+
+        Used by the Test Plans APIs, which do not support ``$top``/``$skip``.
+        """
+        params = dict(params or {})
+        while True:
+            resp = self.request("GET", path, project=project, params=params,
+                                api_version=api_version)
+            data = resp.json()
+            items = data.get(value_key, []) if isinstance(data, dict) else data
+            for item in items:
+                yield item
+            token = resp.headers.get("x-ms-continuationtoken")
+            if not token:
+                return
+            params["continuationToken"] = token
+
     def download(self, url: str, dest_path) -> None:
         with self.request("GET", url, stream=True, api_version=None) as resp:
             with open(dest_path, "wb") as f:
@@ -159,9 +179,19 @@ class AzDoClient:
             params={"includeCapabilities": "true"},
         )
 
-    def repo_clone_url_with_pat(self, remote_url: str) -> str:
-        """Inject the PAT into an HTTPS git remote URL for non-interactive clone."""
+    def git_auth_args(self) -> list[str]:
+        """``git -c`` arguments that authenticate a single git invocation.
+
+        Unlike embedding the PAT in the remote URL, this never persists the
+        credential into the cloned repository's ``config`` file.
+        """
+        return ["-c", f"http.extraheader=AUTHORIZATION: Basic {self._basic_token}"]
+
+    @staticmethod
+    def strip_url_credentials(remote_url: str) -> str:
+        """Remove any ``user:pass@`` userinfo from an HTTP(S) remote URL."""
         parsed = urlparse(remote_url)
-        if parsed.scheme not in ("http", "https"):
+        if parsed.scheme not in ("http", "https") or "@" not in parsed.netloc:
             return remote_url
-        return f"{parsed.scheme}://anything:{self.pat}@{parsed.netloc}{parsed.path}"
+        host = parsed.netloc.rsplit("@", 1)[-1]
+        return parsed._replace(netloc=host).geturl()

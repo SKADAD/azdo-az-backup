@@ -25,9 +25,10 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
 
+from . import __version__
 from .client import AzDoClient, AzDoError
 from .util import chunks, ensure_dir, get_logger, safe_filename
 
@@ -62,6 +63,13 @@ def backup_project(client: AzDoClient, project: str, output_dir: str | os.PathLi
     log.info("Backing up project '%s' into %s", project, out)
     proj_meta = client.get_project(project)
     _write_json(out / "project.json", proj_meta)
+    _write_json(out / "manifest.json", {
+        "tool": "azdo-az-backup",
+        "version": __version__,
+        "org": client.org_name,
+        "project": project,
+        "backed_up_at_utc": datetime.now(timezone.utc).isoformat(),
+    })
 
     _backup_work_items(client, project, out / "work_items")
     _backup_repos(client, project, out / "repos")
@@ -73,19 +81,34 @@ def backup_project(client: AzDoClient, project: str, output_dir: str | os.PathLi
 # --------------------------------------------------------------------- work items
 
 
+_WIQL_PAGE = 19999  # server maximum for a single WIQL result set is 20000
+
+
+def _list_work_item_ids(client: AzDoClient, project: str) -> list[int]:
+    """List every work item ID in the project, paging past the WIQL 20k cap."""
+    ids: list[int] = []
+    last_id = 0
+    while True:
+        wiql = {
+            "query": (
+                "SELECT [System.Id] FROM WorkItems "
+                f"WHERE [System.TeamProject] = @project AND [System.Id] > {last_id} "
+                "ORDER BY [System.Id] ASC"
+            )
+        }
+        res = client.post_json("_apis/wit/wiql", wiql, project=project,
+                               params={"$top": _WIQL_PAGE})
+        page = [w["id"] for w in res.get("workItems", [])]
+        ids.extend(page)
+        if len(page) < _WIQL_PAGE:
+            return ids
+        last_id = page[-1]
+
+
 def _backup_work_items(client: AzDoClient, project: str, out: Path) -> None:
     ensure_dir(out)
     log.info("[%s] Listing work items via WIQL", project)
-    wiql = {
-        "query": (
-            "SELECT [System.Id] FROM WorkItems "
-            f"WHERE [System.TeamProject] = '{project}' "
-            "ORDER BY [System.Id] ASC"
-        )
-    }
-    res = client.post_json("_apis/wit/wiql", wiql, project=project,
-                           params={"$top": 19999})
-    ids = [w["id"] for w in res.get("workItems", [])]
+    ids = _list_work_item_ids(client, project)
     _write_json(out / "index.json", {"project": project, "ids": ids, "count": len(ids)})
     log.info("[%s] %d work items to back up", project, len(ids))
 
@@ -120,9 +143,13 @@ def _save_work_item(client: AzDoClient, project: str, wi: dict,
         if rel.get("rel") == "AttachedFile":
             att_url = rel.get("url", "")
             att_name = (rel.get("attributes") or {}).get("name") or att_url.rsplit("/", 1)[-1]
-            att_id = att_url.rsplit("/", 1)[-1]
+            att_id = att_url.rsplit("/", 1)[-1].split("?")[0]
             dest_dir = ensure_dir(attachments_root / str(wid))
             dest = dest_dir / safe_filename(att_name)
+            if dest.exists():
+                # Two attachments on the same work item share a sanitized
+                # name — disambiguate with the attachment GUID.
+                dest = dest_dir / safe_filename(f"{att_id}_{att_name}")
             try:
                 client.download(att_url, dest)
                 attachments_meta.append({
@@ -157,19 +184,24 @@ def _backup_repos(client: AzDoClient, project: str, out: Path) -> None:
     repos = client.get_json("_apis/git/repositories", project=project).get("value", [])
     _write_json(out / "index.json", {"project": project, "repos": repos})
     log.info("[%s] %d git repos", project, len(repos))
+    auth = client.git_auth_args()
     for repo in repos:
         name = repo["name"]
         remote = repo.get("remoteUrl") or repo.get("webUrl")
         if not remote:
             log.warning("[%s] repo '%s' has no remoteUrl, skipping", project, name)
             continue
+        remote = client.strip_url_credentials(remote)
         target = out / f"{safe_filename(name)}.git"
         if target.exists():
             log.info("[%s] repo '%s' already cloned, fetching updates", project, name)
-            cmd = ["git", "-C", str(target), "remote", "update", "--prune"]
+            # Repair remotes written by older versions that embedded the PAT.
+            subprocess.run(["git", "-C", str(target), "remote", "set-url", "origin", remote],
+                           capture_output=True, text=True)
+            cmd = ["git", *auth, "-C", str(target), "remote", "update", "--prune"]
         else:
             log.info("[%s] cloning '%s'", project, name)
-            cmd = ["git", "clone", "--mirror", client.repo_clone_url_with_pat(remote), str(target)]
+            cmd = ["git", *auth, "clone", "--mirror", remote, str(target)]
         try:
             subprocess.run(cmd, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as exc:
@@ -183,7 +215,7 @@ def _backup_repos(client: AzDoClient, project: str, out: Path) -> None:
 def _backup_test_plans(client: AzDoClient, project: str, out: Path) -> None:
     ensure_dir(out)
     try:
-        plans = list(client.iter_paged(
+        plans = list(client.iter_continuation(
             "_apis/testplan/plans", project=project,
             api_version="7.1-preview.1",
         ))
@@ -198,7 +230,7 @@ def _backup_test_plans(client: AzDoClient, project: str, out: Path) -> None:
         _write_json(plan_dir / "plan.json", plan)
         suites_dir = ensure_dir(plan_dir / "suites")
         try:
-            suites = list(client.iter_paged(
+            suites = list(client.iter_continuation(
                 f"_apis/testplan/Plans/{plan_id}/suites", project=project,
                 api_version="7.1-preview.1",
             ))
@@ -208,7 +240,7 @@ def _backup_test_plans(client: AzDoClient, project: str, out: Path) -> None:
         for suite in suites:
             suite_id = suite["id"]
             try:
-                cases = list(client.iter_paged(
+                cases = list(client.iter_continuation(
                     f"_apis/testplan/Plans/{plan_id}/Suites/{suite_id}/TestCase",
                     project=project, api_version="7.1-preview.3",
                 ))
