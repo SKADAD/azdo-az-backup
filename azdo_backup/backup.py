@@ -30,7 +30,7 @@ from pathlib import Path
 
 from . import __version__
 from .client import AzDoClient, AzDoError
-from .util import chunks, ensure_dir, get_logger, safe_filename
+from .util import chunks, ensure_dir, get_logger, run_git, safe_filename
 
 log = get_logger(__name__)
 
@@ -115,7 +115,12 @@ def _backup_work_items(client: AzDoClient, project: str, out: Path) -> None:
     attachments_root = ensure_dir(out / "attachments")
     for batch in chunks(ids, 200):
         body = {"ids": batch, "$expand": "all", "errorPolicy": "omit"}
-        resp = client.post_json("_apis/wit/workitemsbatch", body, project=project)
+        try:
+            resp = client.post_json("_apis/wit/workitemsbatch", body, project=project)
+        except Exception as exc:
+            log.error("[%s] batch fetch %s..%s failed: %s",
+                      project, batch[0], batch[-1], exc)
+            continue
         items = resp.get("value", []) if isinstance(resp, dict) else resp
         for wi in items:
             try:
@@ -131,12 +136,22 @@ def _save_work_item(client: AzDoClient, project: str, wi: dict,
         f"_apis/wit/workItems/{wid}/revisions",
         project=project, params={"$expand": "all"},
     ))
-    comments_resp = client.get_json(
-        f"_apis/wit/workItems/{wid}/comments",
-        project=project, params={"$expand": "all"},
-        api_version="7.1-preview.4",
-    )
-    comments = comments_resp.get("comments", []) if isinstance(comments_resp, dict) else []
+    # The comments API pages via a continuationToken in the response body.
+    comments: list[dict] = []
+    comment_params: dict = {"$expand": "all", "order": "asc", "$top": 200}
+    while True:
+        comments_resp = client.get_json(
+            f"_apis/wit/workItems/{wid}/comments",
+            project=project, params=comment_params,
+            api_version="7.1-preview.4",
+        )
+        if not isinstance(comments_resp, dict):
+            break
+        comments.extend(comments_resp.get("comments", []))
+        token = comments_resp.get("continuationToken")
+        if not token:
+            break
+        comment_params["continuationToken"] = token
 
     attachments_meta = []
     for rel in wi.get("relations", []) or []:
@@ -187,6 +202,9 @@ def _backup_repos(client: AzDoClient, project: str, out: Path) -> None:
     auth = client.git_auth_args()
     for repo in repos:
         name = repo["name"]
+        if repo.get("isDisabled"):
+            log.info("[%s] repo '%s' is disabled, skipping", project, name)
+            continue
         remote = repo.get("remoteUrl") or repo.get("webUrl")
         if not remote:
             log.warning("[%s] repo '%s' has no remoteUrl, skipping", project, name)
@@ -196,14 +214,13 @@ def _backup_repos(client: AzDoClient, project: str, out: Path) -> None:
         if target.exists():
             log.info("[%s] repo '%s' already cloned, fetching updates", project, name)
             # Repair remotes written by older versions that embedded the PAT.
-            subprocess.run(["git", "-C", str(target), "remote", "set-url", "origin", remote],
-                           capture_output=True, text=True)
+            run_git(["git", "-C", str(target), "remote", "set-url", "origin", remote])
             cmd = ["git", *auth, "-C", str(target), "remote", "update", "--prune"]
         else:
             log.info("[%s] cloning '%s'", project, name)
             cmd = ["git", *auth, "clone", "--mirror", remote, str(target)]
         try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            run_git(cmd, check=True)
         except subprocess.CalledProcessError as exc:
             log.error("[%s] git for '%s' failed: %s", project, name,
                       exc.stderr.strip()[:500] if exc.stderr else exc)

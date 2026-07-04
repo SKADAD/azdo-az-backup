@@ -57,3 +57,25 @@ def test_find_attachment_missing_returns_none(tmp_path):
            "attributes": {"name": "report.pdf"}}
     wi = {"id": 42, "attachments_local": []}
     assert _find_attachment_file(tmp_path, wi, rel) is None
+
+
+def test_remap_classification_path():
+    from azdo_backup.restore import remap_classification_path
+    assert remap_classification_path("Old\\Team A\\Sub", "Old", "New") == "New\\Team A\\Sub"
+    assert remap_classification_path("Old", "Old", "New") == "New"
+    assert remap_classification_path("old\\X", "OLD", "New") == "New\\X"
+    assert remap_classification_path("Other\\X", "Old", "New") == "Other\\X"
+    assert remap_classification_path(None, "Old", "New") is None
+    assert remap_classification_path("", "Old", "New") == ""
+
+
+def test_fields_to_patch_remaps_paths():
+    fields = {
+        "System.AreaPath": "Old\\Team A",
+        "System.IterationPath": "Old\\Sprint 1",
+        "System.Title": "t",
+    }
+    patch = _fields_to_patch(fields, old_project="Old", new_project="New")
+    by_path = {p["path"]: p["value"] for p in patch}
+    assert by_path["/fields/System.AreaPath"] == "New\\Team A"
+    assert by_path["/fields/System.IterationPath"] == "New\\Sprint 1"

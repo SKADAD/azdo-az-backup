@@ -106,6 +106,18 @@ Flags to selectively skip categories: `--skip-work-items`, `--skip-repos`,
           suites/<suite-id>.json        # suite + ordered test cases
 ```
 
+## Restore behavior
+
+- The target project is created with the **source project's process template**
+  (override with `--process`).
+- **Area and iteration paths** referenced by work items are recreated in the
+  target project and re-rooted under the new project name.
+- **Work-item links** are recreated once per link (directional links from the
+  forward side, symmetric links from the lower-ID side) with IDs remapped.
+- Repos are pushed as explicit `refs/heads/*` and `refs/tags/*` refspecs —
+  Azure DevOps rejects pushes of its server-managed hidden refs
+  (`refs/pull/*`), so a raw `--mirror` push would fail.
+
 ## Restore caveats
 
 Azure DevOps imposes some limitations that no third-party tool can work around:
@@ -119,7 +131,10 @@ Azure DevOps imposes some limitations that no third-party tool can work around:
 - **Authors/timestamps** are set using `bypassRules=true` where the server
   allows it; some collections will still rewrite them.
 - **Test runs / test points / results** are not restored — only the plans,
-  suites, and test-case associations.
+  suites, and test-case associations. Requirement-based suites whose
+  requirement work item was not restored fall back to static suites.
+- **Query-based suites** keep their original query string, which may still
+  reference the old project name in path clauses — review after restore.
 
 ## Repository clones
 
