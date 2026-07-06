@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
 
 import requests
@@ -43,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Back up every project in the org.")
     b.add_argument("--output", "-o", required=True,
                    help="Output directory.")
+    b.add_argument("--archive", action="store_true",
+                   help="Also produce a single <output>.zip of the whole backup.")
 
     # restore
     r = sub.add_parser("restore", help="Restore a backed-up project (or a whole "
@@ -50,10 +55,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_args(r)
     r.add_argument("--source", required=True,
                    help="Path to a project backup directory (containing "
-                        "project.json), or with --all-projects the org backup "
-                        "root (containing projects/).")
+                        "project.json), an org backup root (containing "
+                        "projects/), or a .zip produced by backup --archive.")
     r.add_argument("--project",
                    help="Target project name (single-project restore).")
+    r.add_argument("--source-project",
+                   help="Which project to restore when the source contains "
+                        "several (org backup or archive).")
     r.add_argument("--all-projects", action="store_true",
                    help="Restore every project from an org backup; target names "
                         "default to the original project names.")
@@ -83,6 +91,9 @@ def _cmd_backup(client: AzDoClient, args: argparse.Namespace) -> int:
         # Same layout as org backups so restore instructions are uniform.
         proj_dir = out / "projects" / safe_filename(args.project)
         stats = backup_project(client, args.project, proj_dir)
+    if args.archive:
+        zip_path = shutil.make_archive(str(out), "zip", root_dir=out)
+        print(f"Archive: {zip_path}")
     print(json.dumps(stats.as_dict()["counts"], indent=2))
     if stats.errors:
         print(f"Backup finished with {len(stats.errors)} error(s) — "
@@ -90,6 +101,39 @@ def _cmd_backup(client: AzDoClient, args: argparse.Namespace) -> int:
         return EXIT_PARTIAL
     print(f"Backup complete: {out}")
     return EXIT_OK
+
+
+def _safe_extract_zip(zip_path: Path, dest: Path) -> None:
+    with zipfile.ZipFile(zip_path) as zf:
+        for member in zf.namelist():
+            target = (dest / member).resolve()
+            if not str(target).startswith(str(dest.resolve())):
+                raise AzDoError(f"unsafe path in archive: {member}")
+        zf.extractall(dest)
+
+
+def _resolve_project_source(src: Path, source_project: str | None) -> Path:
+    """Find the single project dir to restore inside an org backup root."""
+    if (src / "project.json").exists():
+        return src
+    projects_dir = src / "projects"
+    candidates = []
+    if projects_dir.is_dir():
+        candidates = sorted(p for p in projects_dir.iterdir()
+                            if (p / "project.json").exists())
+    if source_project:
+        for p in candidates:
+            original = json.loads((p / "project.json").read_text(encoding="utf-8"))
+            if source_project.lower() in (p.name.lower(),
+                                          (original.get("name") or "").lower()):
+                return p
+        raise AzDoError(f"project '{source_project}' not found in {src}")
+    if len(candidates) == 1:
+        return candidates[0]
+    names = [p.name for p in candidates]
+    raise AzDoError(
+        f"{src} contains {len(candidates)} project backups {names} — "
+        "pick one with --source-project or use --all-projects")
 
 
 def _cmd_restore(client: AzDoClient, args: argparse.Namespace) -> int:
@@ -103,12 +147,24 @@ def _cmd_restore(client: AzDoClient, args: argparse.Namespace) -> int:
         skip_test_plans=args.skip_test_plans,
     )
 
+    id_map_dir = None
+    if src.is_file() and src.suffix.lower() == ".zip":
+        extracted = Path(tempfile.mkdtemp(prefix="azdo-restore-"))
+        log.info("Extracting archive %s", src)
+        _safe_extract_zip(src, extracted)
+        # The extraction dir is ephemeral; keep the resume id-map next to
+        # the archive instead.
+        id_map_dir = src.parent
+        src = extracted
+    common["id_map_dir"] = id_map_dir
+
     if not args.all_projects:
         if not args.project:
             print("error: --project is required (or use --all-projects)",
                   file=sys.stderr)
             return EXIT_USAGE
-        summary = restore_project(client, src, args.project, **common)
+        proj_src = _resolve_project_source(src, args.source_project)
+        summary = restore_project(client, proj_src, args.project, **common)
         print(json.dumps(summary, indent=2))
         return EXIT_OK
 

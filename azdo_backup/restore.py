@@ -90,6 +90,7 @@ def restore_project(
     skip_work_items: bool = False,
     skip_repos: bool = False,
     skip_test_plans: bool = False,
+    id_map_dir: str | os.PathLike | None = None,
 ) -> dict:
     src = Path(source_dir)
     if not (src / "project.json").exists():
@@ -111,7 +112,10 @@ def restore_project(
                "target_project_id": new_project.get("id")}
 
     old_project_name = original.get("name") or new_project_name
-    id_map_path = src / f"id_map.{safe_filename(new_project_name)}.json"
+    # When restoring from an extracted archive the source dir is ephemeral —
+    # callers pass a durable id_map_dir so resume still works.
+    map_dir = Path(id_map_dir) if id_map_dir else src
+    id_map_path = map_dir / f"id_map.{safe_filename(new_project_name)}.json"
     id_map = _load_id_map(id_map_path)
     if id_map:
         log.info("Loaded existing id map (%d entries) — restore will resume",
