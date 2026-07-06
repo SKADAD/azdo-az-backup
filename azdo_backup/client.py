@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Iterator
@@ -55,11 +56,22 @@ class AzDoClient:
             )
         self.timeout = timeout
         self._basic_token = base64.b64encode(f":{self.pat}".encode()).decode()
-        self.session = requests.Session()
-        self.session.headers.update({
+        self._headers = {
             "Authorization": f"Basic {self._basic_token}",
             "Accept": "application/json",
-        })
+        }
+        self._local = threading.local()
+
+    @property
+    def session(self) -> requests.Session:
+        """One Session per thread — requests.Session is not thread-safe,
+        and backup work is fanned out across a thread pool."""
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update(self._headers)
+            self._local.session = session
+        return session
 
     @staticmethod
     def _extract_org_name(org_url: str) -> str:
@@ -306,11 +318,11 @@ class AzDoClient:
                 end = sent + len(chunk) - 1
                 self.request(
                     "PUT", url, data=chunk,
+                    params={"uploadType": "chunked", "fileName": name},
                     headers={
                         "Content-Type": "application/octet-stream",
                         "Content-Range": f"bytes {sent}-{end}/{size}",
                     },
-                    api_version=None,
                 )
                 sent += len(chunk)
         return url

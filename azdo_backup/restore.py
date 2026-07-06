@@ -116,14 +116,15 @@ def restore_project(
     # callers pass a durable id_map_dir so resume still works.
     map_dir = Path(id_map_dir) if id_map_dir else src
     id_map_path = map_dir / f"id_map.{safe_filename(new_project_name)}.json"
-    id_map = _load_id_map(id_map_path)
+    id_map, pass2_done = _load_restore_state(id_map_path)
     if id_map:
-        log.info("Loaded existing id map (%d entries) — restore will resume",
-                 len(id_map))
+        log.info("Loaded existing id map (%d entries, %d fully restored) — "
+                 "restore will resume", len(id_map), len(pass2_done))
 
     if not skip_work_items and (src / "work_items").exists():
         id_map = _restore_work_items(client, new_project_name, src / "work_items",
                                      old_project=old_project_name, id_map=id_map,
+                                     pass2_done=pass2_done,
                                      id_map_path=id_map_path)
         summary["work_items_mapped"] = len(id_map)
         summary["id_map_file"] = str(id_map_path)
@@ -144,16 +145,29 @@ def restore_project(
     return summary
 
 
-def _load_id_map(path: Path) -> dict[int, int]:
+def _load_restore_state(path: Path) -> tuple[dict[int, int], set[int]]:
+    """Load the resume state: (old->new id map, ids whose pass 2 finished).
+
+    Handles both the v2 format and legacy flat-map files (which predate
+    pass-2 tracking — treat those items as fully restored, matching the
+    old behavior).
+    """
     if not path.exists():
-        return {}
+        return {}, set()
     raw = _read_json(path)
-    return {int(k): int(v) for k, v in raw.items()}
+    if isinstance(raw, dict) and raw.get("format") == 2:
+        id_map = {int(k): int(v) for k, v in (raw.get("map") or {}).items()}
+        done = {int(x) for x in raw.get("pass2_done", [])}
+        return id_map, done
+    id_map = {int(k): int(v) for k, v in raw.items()}
+    return id_map, set(id_map)
 
 
-def _write_id_map(path: Path, id_map: dict[int, int]) -> None:
+def _write_restore_state(path: Path, id_map: dict[int, int],
+                         pass2_done: set[int]) -> None:
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(id_map, f, indent=2)
+        json.dump({"format": 2, "map": id_map,
+                   "pass2_done": sorted(pass2_done)}, f, indent=2)
 
 
 # --------------------------------------------------------------------- project
@@ -291,10 +305,12 @@ def _ensure_classification_nodes(client: AzDoClient, project: str,
 def _restore_work_items(client: AzDoClient, project: str, src: Path,
                         *, old_project: str,
                         id_map: dict[int, int] | None = None,
+                        pass2_done: set[int] | None = None,
                         id_map_path: Path | None = None) -> dict[int, int]:
     idx = _read_json(src / "index.json")
     ids = idx["ids"]
     id_map = dict(id_map or {})
+    pass2_done = set(pass2_done or set())
     log.info("[%s] restoring %d work items (%d already mapped)",
              project, len(ids), len(id_map))
 
@@ -325,7 +341,6 @@ def _restore_work_items(client: AzDoClient, project: str, src: Path,
     _ensure_classification_nodes(client, project, "iterations", iteration_paths)
 
     # Pass 1: create items with primitive fields only.
-    newly_created: list[int] = []
     for old_id in ids:
         if old_id in id_map:
             continue  # already restored by a previous (partial) run
@@ -345,52 +360,98 @@ def _restore_work_items(client: AzDoClient, project: str, src: Path,
                                     old_project=old_project, old_id=old_id)
         if created:
             id_map[old_id] = created["id"]
-            newly_created.append(old_id)
 
     # Persist the map before pass 2: a crash there must not cause the next
     # run to recreate (duplicate) all the items pass 1 already made.
     if id_map_path is not None:
-        _write_id_map(id_map_path, id_map)
+        _write_restore_state(id_map_path, id_map, pass2_done)
 
-    # Pass 2: attachments + relations + comments (only for new items).
+    # Pass 2: attachments + relations + comments — for every mapped item
+    # not yet enriched, including ones a previous crashed run created but
+    # never finished.
+    pending = [old_id for old_id in ids
+               if old_id in id_map and old_id not in pass2_done
+               and (src / f"{old_id}.json").exists()]
     dropped_relations: Counter = Counter()
-    for old_id in newly_created:
+    for i, old_id in enumerate(pending, start=1):
         new_id = id_map[old_id]
         wi = _read_json(src / f"{old_id}.json")
-        try:
-            _restore_relations(client, project, src.parent, wi, new_id, id_map,
-                               dropped_relations)
-        except Exception as exc:
-            log.error("[%s] relations for WI %s->%s failed: %s",
-                      project, old_id, new_id, exc)
-        # Provenance comment.
-        try:
-            client.post_json(
-                f"_apis/wit/workItems/{new_id}/comments",
-                {"text": f"Restored from work item #{old_id} (rev {wi.get('rev')})."},
-                project=project, api_version="7.1-preview.4",
-            )
-        except Exception as exc:
-            log.warning("[%s] provenance comment on WI %s failed: %s",
-                        project, new_id, exc)
-        # Original comments.
-        for c in wi.get("comments", []) or []:
-            text = c.get("text") or ""
-            if not text:
-                continue
-            try:
-                client.post_json(
-                    f"_apis/wit/workItems/{new_id}/comments",
-                    {"text": f"[original by {(c.get('createdBy') or {}).get('displayName','?')} at {c.get('createdDate','?')}]\n\n{text}"},
-                    project=project, api_version="7.1-preview.4",
-                )
-            except Exception as exc:
-                log.warning("[%s] comment on WI %s failed: %s", project, new_id, exc)
+        _enrich_work_item(client, project, src, wi, old_id, new_id, id_map,
+                          dropped_relations)
+        pass2_done.add(old_id)
+        # Persist progress so an interrupt resumes where it left off.
+        if id_map_path is not None and (i % 25 == 0 or i == len(pending)):
+            _write_restore_state(id_map_path, id_map, pass2_done)
 
     if dropped_relations:
         log.warning("[%s] relations not restored (unsupported types): %s",
                     project, dict(dropped_relations))
     return id_map
+
+
+_COMPREF_RE = re.compile(r'(<compref[^>]*\bref=")(\d+)(")')
+
+
+def remap_steps_comprefs(steps_xml: str, id_map: dict[int, int]) -> str:
+    """Rewrite shared-steps references in test case steps XML to new IDs."""
+    def sub(m: re.Match) -> str:
+        new = id_map.get(int(m.group(2)))
+        return m.group(1) + (str(new) if new else m.group(2)) + m.group(3)
+    return _COMPREF_RE.sub(sub, steps_xml)
+
+
+def _enrich_work_item(client: AzDoClient, project: str, src: Path, wi: dict,
+                      old_id: int, new_id: int, id_map: dict[int, int],
+                      dropped_relations: Counter) -> None:
+    """Pass 2 for one item: relations, attachments, comments, steps refs."""
+    try:
+        _restore_relations(client, project, src.parent, wi, new_id, id_map,
+                           dropped_relations)
+    except Exception as exc:
+        log.error("[%s] relations for WI %s->%s failed: %s",
+                  project, old_id, new_id, exc)
+
+    # Test case steps reference shared-steps work items by their OLD id.
+    steps = (wi.get("fields") or {}).get("Microsoft.VSTS.TCM.Steps")
+    if steps and "<compref" in steps:
+        remapped = remap_steps_comprefs(steps, id_map)
+        if remapped != steps:
+            try:
+                client.patch_json(
+                    f"_apis/wit/workitems/{new_id}",
+                    [{"op": "add", "path": "/fields/Microsoft.VSTS.TCM.Steps",
+                      "value": remapped}],
+                    project=project,
+                    params={"bypassRules": "true",
+                            "suppressNotifications": "true"},
+                )
+            except AzDoError as exc:
+                log.warning("[%s] steps compref remap on WI %s failed: %s",
+                            project, new_id, exc)
+
+    # Provenance comment.
+    try:
+        client.post_json(
+            f"_apis/wit/workItems/{new_id}/comments",
+            {"text": f"Restored from work item #{old_id} (rev {wi.get('rev')})."},
+            project=project, api_version="7.1-preview.4",
+        )
+    except Exception as exc:
+        log.warning("[%s] provenance comment on WI %s failed: %s",
+                    project, new_id, exc)
+    # Original comments.
+    for c in wi.get("comments", []) or []:
+        text = c.get("text") or ""
+        if not text:
+            continue
+        try:
+            client.post_json(
+                f"_apis/wit/workItems/{new_id}/comments",
+                {"text": f"[original by {(c.get('createdBy') or {}).get('displayName','?')} at {c.get('createdDate','?')}]\n\n{text}"},
+                project=project, api_version="7.1-preview.4",
+            )
+        except Exception as exc:
+            log.warning("[%s] comment on WI %s failed: %s", project, new_id, exc)
 
 
 def _create_work_item(client: AzDoClient, project: str, wit: str, fields: dict,

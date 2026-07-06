@@ -185,7 +185,9 @@ def test_restore_twice_from_archive_is_idempotent(archive, stub):
 
     id_map_file = zip_path.parent / "id_map.Beta.json"
     assert id_map_file.is_file()
-    assert set(json.loads(id_map_file.read_text())) == {"1", "2", "3"}
+    state_raw = json.loads(id_map_file.read_text())
+    assert set(state_raw["map"]) == {"1", "2", "3"}
+    assert sorted(state_raw["pass2_done"]) == [1, 2, 3]
 
 
 def test_zip_restore_cleans_up_extraction_dir(archive, stub, monkeypatch, tmp_path):
@@ -203,3 +205,73 @@ def test_zip_restore_cleans_up_extraction_dir(archive, stub, monkeypatch, tmp_pa
         assert leftovers == []
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+# ------------------------------------------------------------- concurrency
+
+
+def test_concurrent_backup_matches_sequential(stub, tmp_path):
+    """--workers 8 must produce a complete, error-free backup too."""
+    _, base_url = stub
+    out = tmp_path / "concurrent"
+    rc = cli.main(["backup", "--org", f"{base_url}/myorg", "--pat", "t",
+                   "--project", "Alpha", "-o", str(out), "--workers", "8"])
+    assert rc == 0
+    summary = json.loads(
+        (out / "projects" / "Alpha" / "summary.json").read_text())
+    assert summary["error_count"] == 0, summary["errors"]
+    assert summary["counts"]["work_items"] == 3
+    report = verify_backup(out)
+    assert report.ok, report.problems
+
+
+# ------------------------------------------------------- pass-2 crash resume
+
+
+def test_resume_completes_pass2_after_crash(stub, archive, tmp_path, monkeypatch):
+    """A crash between pass 1 and pass 2 must not lose relations/comments:
+    the re-run finishes enrichment for created-but-unenriched items."""
+    import azdo_backup.restore as restore_mod
+    state, base_url = stub
+    _, zip_path = archive
+    workdir = tmp_path / "crash"
+    workdir.mkdir()
+    import shutil as _shutil
+    crash_zip = workdir / "crash.zip"
+    _shutil.copy(zip_path, crash_zip)
+
+    # Crash the first run at the start of pass 2.
+    real_enrich = restore_mod._enrich_work_item
+    calls = {"n": 0}
+
+    def exploding_enrich(*a, **kw):
+        calls["n"] += 1
+        raise KeyboardInterrupt  # simulates an operator abort mid-pass-2
+
+    monkeypatch.setattr(restore_mod, "_enrich_work_item", exploding_enrich)
+    args = ["restore", "--org", f"{base_url}/myorg", "--pat", "t",
+            "--source", str(crash_zip), "--project", "Gamma"]
+    rc = cli.main(args)
+    assert rc == 130  # interrupted
+    assert calls["n"] == 1
+
+    # Pass 1 was persisted, pass 2 was not marked done.
+    state_raw = json.loads((workdir / "id_map.Gamma.json").read_text())
+    assert state_raw["format"] == 2
+    assert len(state_raw["map"]) == 3
+    assert state_raw["pass2_done"] == []
+
+    created_after_crash = dict(state.created_work_items)
+
+    # Second run: no new work items, but enrichment completes.
+    monkeypatch.setattr(restore_mod, "_enrich_work_item", real_enrich)
+    assert cli.main(args) == 0
+    assert state.created_work_items == created_after_crash  # no duplicates
+    state_raw = json.loads((workdir / "id_map.Gamma.json").read_text())
+    assert sorted(state_raw["pass2_done"]) == [1, 2, 3]
+    # The bug's attachment reached the new item this time.
+    gamma_bug = next(new for old, new in state_raw["map"].items()
+                     if old == "1")
+    att = [p["value"] for p in state.relation_patches.get(gamma_bug, [])
+           if p["value"].get("rel") == "AttachedFile"]
+    assert len(att) == 1

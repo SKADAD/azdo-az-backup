@@ -20,7 +20,7 @@ class StubState:
         self.base_url = None            # set once the server knows its port
         self.repo_root = None           # dir for git repos (set by fixture)
         self.src_repo_url = None        # file:// URL of the Alpha repo
-        self.beta_created = False
+        self.created_projects = set()   # lowercase names created via POST
         self.next_wi_id = 100
         self.created_work_items = {}    # new_id -> {"type": str, "fields": {}}
         self.relation_patches = {}      # new_id -> [patch ops]
@@ -228,8 +228,8 @@ def _make_handler(state: StubState):
         def get_project(self, name):
             if name.lower() == "alpha" or name == "proj-alpha":
                 self._send(state.project_alpha())
-            elif name.lower() == "beta" and state.beta_created:
-                self._send({"id": "proj-beta", "name": "Beta",
+            elif name.lower() in state.created_projects:
+                self._send({"id": f"proj-{name.lower()}", "name": name,
                             "state": "wellFormed"})
             else:
                 self._not_found(f"project {name}")
@@ -303,7 +303,8 @@ def _make_handler(state: StubState):
             self._send({"value": items, "count": len(items)})
 
         def post_create_project(self):
-            state.beta_created = True
+            body = self._json_body() or {}
+            state.created_projects.add((body.get("name") or "beta").lower())
             self._send({"id": "op-1", "status": "queued"})
 
         def post_classification(self, project, group, parent=None):

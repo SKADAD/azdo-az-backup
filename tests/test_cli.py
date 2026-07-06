@@ -29,7 +29,7 @@ def test_list_projects_exit_code(capsys):
 def test_backup_single_project_uses_projects_layout(monkeypatch, tmp_path):
     captured = {}
 
-    def fake_backup_project(client, project, out, stats=None):
+    def fake_backup_project(client, project, out, stats=None, **kw):
         captured["out"] = out
         return BackupStats()
 
@@ -41,7 +41,7 @@ def test_backup_single_project_uses_projects_layout(monkeypatch, tmp_path):
 
 
 def test_backup_partial_failure_exit_code(monkeypatch, tmp_path):
-    def fake_backup_project(client, project, out, stats=None):
+    def fake_backup_project(client, project, out, stats=None, **kw):
         stats = BackupStats()
         stats.error("boom")
         return stats

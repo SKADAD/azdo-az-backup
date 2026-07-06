@@ -30,6 +30,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,18 +43,24 @@ log = get_logger(__name__)
 
 
 class BackupStats:
-    """Collects non-fatal errors so a partial backup is detectable."""
+    """Collects non-fatal errors so a partial backup is detectable.
+
+    Thread-safe: work items are backed up from a thread pool.
+    """
 
     def __init__(self) -> None:
         self.errors: list[str] = []
         self.counts: dict[str, int] = {}
+        self._lock = threading.Lock()
 
     def error(self, message: str) -> None:
-        self.errors.append(message)
+        with self._lock:
+            self.errors.append(message)
         log.error("%s", message)
 
     def add(self, key: str, n: int = 1) -> None:
-        self.counts[key] = self.counts.get(key, 0) + n
+        with self._lock:
+            self.counts[key] = self.counts.get(key, 0) + n
 
     def as_dict(self) -> dict:
         return {"counts": self.counts, "error_count": len(self.errors),
@@ -71,9 +79,12 @@ def _write_json(path: Path, data) -> None:
 # --------------------------------------------------------------------- top level
 
 
-def backup_org(client: AzDoClient, output_dir: str | os.PathLike) -> BackupStats:
+def backup_org(client: AzDoClient, output_dir: str | os.PathLike,
+               *, workers: int = 4,
+               exclude_projects: set[str] | None = None) -> BackupStats:
     out = ensure_dir(output_dir)
     stats = BackupStats()
+    excluded = {name.strip().lower() for name in (exclude_projects or set())}
     projects = client.list_projects()
     _write_json(out / "org.json", {"org": client.org_name, "projects": projects})
     log.info("Found %d projects in org '%s'", len(projects), client.org_name)
@@ -83,9 +94,14 @@ def backup_org(client: AzDoClient, output_dir: str | os.PathLike) -> BackupStats
             log.info("Skipping project '%s' (state=%s)", proj["name"], proj.get("state"))
             stats.add("projects_skipped")
             continue
+        if proj["name"].strip().lower() in excluded:
+            log.info("Skipping project '%s' (--exclude-projects)", proj["name"])
+            stats.add("projects_excluded")
+            continue
         try:
             backup_project(client, proj["name"],
-                           projects_dir / safe_filename(proj["name"]), stats=stats)
+                           projects_dir / safe_filename(proj["name"]),
+                           stats=stats, workers=workers)
             stats.add("projects_backed_up")
         except AzDoAuthError:
             raise  # credentials are gone; every further call would fail too
@@ -97,7 +113,8 @@ def backup_org(client: AzDoClient, output_dir: str | os.PathLike) -> BackupStats
 
 def backup_project(client: AzDoClient, project: str,
                    output_dir: str | os.PathLike,
-                   stats: BackupStats | None = None) -> BackupStats:
+                   stats: BackupStats | None = None,
+                   *, workers: int = 4) -> BackupStats:
     out = ensure_dir(output_dir)
     stats = stats if stats is not None else BackupStats()
     log.info("Backing up project '%s' into %s", project, out)
@@ -118,7 +135,8 @@ def backup_project(client: AzDoClient, project: str,
                     "backed up by this tool (git repositories only)")
 
     _backup_classification_nodes(client, project, out, stats)
-    _backup_work_items(client, project, out / "work_items", stats)
+    _backup_work_items(client, project, out / "work_items", stats,
+                       workers=workers)
     _backup_repos(client, project, out / "repos", stats)
     _backup_test_plans(client, project, out / "test_plans", stats)
 
@@ -171,41 +189,60 @@ def _list_work_item_ids(client: AzDoClient, project: str) -> list[int]:
         last_id = page[-1]
 
 
+def _backup_one_work_item(client: AzDoClient, project: str, wi: dict,
+                          out: Path, attachments_root: Path,
+                          stats: BackupStats) -> int:
+    """Worker: save one work item; returns its ID on success."""
+    if _work_item_unchanged(out, wi):
+        stats.add("work_items_unchanged")
+        return wi["id"]
+    _save_work_item(client, project, wi, out, attachments_root, stats)
+    stats.add("work_items")
+    return wi["id"]
+
+
 def _backup_work_items(client: AzDoClient, project: str, out: Path,
-                       stats: BackupStats) -> None:
+                       stats: BackupStats, *, workers: int = 4) -> None:
     ensure_dir(out)
     log.info("[%s] Listing work items via WIQL", project)
     ids = _list_work_item_ids(client, project)
     _write_json(out / "index.json", {"project": project, "ids": ids, "count": len(ids)})
-    log.info("[%s] %d work items to back up", project, len(ids))
+    log.info("[%s] %d work items to back up (workers=%d)", project, len(ids), workers)
 
     attachments_root = ensure_dir(out / "attachments")
     saved: set[int] = set()
-    for batch in chunks(ids, 200):
-        body = {"ids": batch, "$expand": "all", "errorPolicy": "omit"}
-        try:
-            resp = client.post_json("_apis/wit/workitemsbatch", body,
-                                    project=project, idempotent=True)
-        except AzDoAuthError:
-            raise
-        except Exception as exc:
-            stats.error(f"[{project}] work item batch {batch[0]}..{batch[-1]} "
-                        f"fetch failed: {exc}")
-            continue
-        items = resp.get("value", []) if isinstance(resp, dict) else resp
-        for wi in items:
+    workers = max(1, workers)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for batch in chunks(ids, 200):
+            body = {"ids": batch, "$expand": "all", "errorPolicy": "omit"}
             try:
-                if _work_item_unchanged(out, wi):
-                    saved.add(wi["id"])
-                    stats.add("work_items_unchanged")
-                    continue
-                _save_work_item(client, project, wi, out, attachments_root, stats)
-                saved.add(wi["id"])
-                stats.add("work_items")
+                resp = client.post_json("_apis/wit/workitemsbatch", body,
+                                        project=project, idempotent=True)
             except AzDoAuthError:
                 raise
             except Exception as exc:
-                stats.error(f"[{project}] work item {wi.get('id')} failed: {exc}")
+                stats.error(f"[{project}] work item batch {batch[0]}..{batch[-1]} "
+                            f"fetch failed: {exc}")
+                continue
+            items = resp.get("value", []) if isinstance(resp, dict) else resp
+            futures = {
+                pool.submit(_backup_one_work_item, client, project, wi,
+                            out, attachments_root, stats): wi
+                for wi in items
+            }
+            for fut in as_completed(futures):
+                wi = futures[fut]
+                try:
+                    saved.add(fut.result())
+                except AzDoAuthError:
+                    # Credentials are gone — abort instead of eroding the
+                    # backup item by item.
+                    for other in futures:
+                        other.cancel()
+                    raise
+                except Exception as exc:
+                    stats.error(f"[{project}] work item {wi.get('id')} "
+                                f"failed: {exc}")
 
     missing = sorted(set(ids) - saved)
     if missing:

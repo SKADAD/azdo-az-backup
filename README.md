@@ -77,7 +77,13 @@ azdo-backup backup \
 ```
 
 Both write to `<output>/projects/<name>`, so restore commands are identical
-either way. Re-running a backup is incremental for git repos and attachments.
+either way. Re-running a backup is incremental for git repos, attachments
+and unchanged work items.
+
+Work items are fetched with 4 concurrent workers by default; use
+`--workers N` to raise it for large projects (or lower it when hitting
+rate limits). In `--all-projects` mode, `--exclude-projects "Sandbox,Temp"`
+skips projects you don't want in the archive.
 
 Add `--archive` to also produce a single self-contained `<output>.zip` —
 an offline artifact containing everything (work item JSON, attachment
@@ -205,9 +211,14 @@ incomplete — the file is written only after everything else finished.
   parent-first (requirement suites remap their requirement ID; query suites
   get their WIQL rewritten to the new project name), and test cases are added
   only to static suites.
-- **Resume**: work items already in `id_map.<target>.json` are skipped, and
-  test plans that already exist by name are skipped, so a failed restore can
-  simply be re-run.
+- **Resume**: `id_map.<target>.json` tracks both created work items and
+  which ones finished enrichment (attachments/links/comments), so a failed
+  restore — even one interrupted mid-enrichment — can simply be re-run
+  without duplicating items. Progress is checkpointed every 25 items; a
+  hard kill may re-post comments for at most that window. Test plans that
+  already exist by name are skipped.
+- **Shared-steps references** inside test case steps XML (`<compref ref>`)
+  are rewritten to the new work item IDs.
 
 ## Restore caveats
 
