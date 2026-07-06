@@ -79,6 +79,10 @@ azdo-backup backup \
 Both write to `<output>/projects/<name>`, so restore commands are identical
 either way. Re-running a backup is incremental for git repos and attachments.
 
+Add `--archive` to also produce a single self-contained `<output>.zip` —
+an offline artifact containing everything (work item JSON, attachment
+binaries, git mirrors, test plans).
+
 ### Restore a project
 
 ```bash
@@ -87,6 +91,12 @@ azdo-backup restore \
   --source ./backups/projects/Contoso \
   --project Contoso-Restored
 ```
+
+`--source` also accepts a `.zip` produced by `backup --archive` (extracted
+to a temp dir automatically; the resume id-map is kept next to the archive).
+The target can be a different org or **the same collection** — e.g. clone
+`Contoso` to `Contoso-Copy` in place. If an archive contains several
+projects, pick one with `--source-project`.
 
 ### Restore an entire org backup
 
