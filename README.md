@@ -8,24 +8,26 @@ repositories), with auth aligned to the `az devops` CLI convention.
 
 Backs up:
 
-- **Work items** — every revision, all comments, all `AttachedFile` binaries,
-  plus links and relations.
+- **Work items** — every revision, all comments, all `AttachedFile` binaries
+  (including attachments later removed from the item), links and relations.
 - **Git repositories** — bare mirror clones (all branches, tags, refs).
-- **Test plans, suites and test cases.**
+- **Test plans, suites, test cases, configurations and variables.**
+- **Area/iteration trees** (including iteration dates).
 
 Intentionally skipped (per requirements): boards configuration, wiki, package
-feeds, build artifacts.
+feeds, build artifacts. Not covered by design: TFVC repositories (the tool
+warns loudly if a project uses TFVC), Git LFS objects, test run results.
 
-Restores into a **new project** (in the same org or a different org). Azure
-DevOps does not let you set work-item IDs, so an `id_map.json` from old →
-new IDs is written alongside the backup after restore.
+Restores into **new projects** (same org or a different org) — a single
+project or a whole org backup at once. Azure DevOps does not let you set
+work-item IDs, so an `id_map.<target>.json` (old → new) is written next to
+the backup; re-running a restore loads it and resumes instead of duplicating.
 
 ## Install
 
 ```bash
-python -m pip install -e .
-# or just:
-python -m pip install -r requirements.txt
+python -m pip install -e .          # tool only
+python -m pip install -e .[dev]     # + pytest, ruff
 ```
 
 Requires Python 3.9+ and `git` on `PATH`.
@@ -42,8 +44,11 @@ Generate a Personal Access Token with at least these scopes:
 Pass it via `--pat` or, like `az devops`, export it:
 
 ```bash
-export AZURE_DEVOPS_EXT_PAT=xxxxxxxxxxxxxxxxxxxx
+export AZURE_DEVOPS_EXT_PAT=xxxxxxxxxxxxxxxxxxxx   # or AZDO_PAT
 ```
+
+An invalid or expired PAT is detected explicitly (the service answers with a
+sign-in page, not a 401) and aborts the run with a clear error.
 
 ## Usage
 
@@ -71,92 +76,135 @@ azdo-backup backup \
   --output ./backups
 ```
 
-### Restore into a new project
+Both write to `<output>/projects/<name>`, so restore commands are identical
+either way. Re-running a backup is incremental for git repos and attachments.
+
+### Restore a project
 
 ```bash
 azdo-backup restore \
   --org https://dev.azure.com/another-org \
   --source ./backups/projects/Contoso \
-  --project Contoso-Restored \
-  --process Agile
+  --project Contoso-Restored
 ```
 
-Flags to selectively skip categories: `--skip-work-items`, `--skip-repos`,
-`--skip-test-plans`.
+### Restore an entire org backup
+
+```bash
+azdo-backup restore \
+  --org https://dev.azure.com/another-org \
+  --source ./backups \
+  --all-projects \
+  --prefix "Restored-"
+```
+
+Target names default to the original project names (plus the optional
+prefix). Flags to selectively skip categories: `--skip-work-items`,
+`--skip-repos`, `--skip-test-plans`. The process template defaults to the
+source project's process; override with `--process`.
+
+### Exit codes
+
+| code | meaning |
+|------|---------|
+| 0    | success |
+| 1    | fatal error (auth, network exhaustion) |
+| 2    | usage error |
+| 3    | finished, but with per-item errors (see `summary.json` / output) |
 
 ## On-disk layout
 
 ```
 <output>/
   org.json                              # only when --all-projects
+  summary.json                          # org-level completion marker
   projects/
     <project-name>/
       project.json
+      manifest.json                     # tool version, org, timestamp
+      summary.json                      # written LAST — completion marker + errors
+      classification_nodes.json         # area/iteration trees (with dates)
       work_items/
         index.json
         <id>.json                       # fields + relations + revisions + comments
-        attachments/<id>/<filename>
+        attachments/<id>/<guid>_<name>  # deterministic, collision-free names
       repos/
-        index.json
+        index.json                      # repo metadata incl. backup_dir mapping
         <repo-name>.git/                # bare mirror clone
       test_plans/
         index.json
+        configurations.json
+        variables.json
         <plan-id>/
           plan.json
           suites/<suite-id>.json        # suite + ordered test cases
 ```
 
+A backup without a `summary.json` (or with `error_count > 0` in it) is
+incomplete — the file is written only after everything else finished.
+
 ## Restore behavior
 
 - The target project is created with the **source project's process template**
   (override with `--process`).
-- **Area and iteration paths** referenced by work items are recreated in the
-  target project and re-rooted under the new project name.
+- The **area/iteration tree** is restored from `classification_nodes.json`
+  (keeping iteration dates), and any paths referenced by work items or test
+  plans are created as a fallback; all paths are re-rooted under the new
+  project name.
+- **Work items**: full fields first; if the server rejects them (e.g. a state
+  that doesn't exist in the target process), retried without state fields,
+  then with a minimal field set — so the item is never silently lost.
+  Board-scoped `WEF_*` fields and server-managed fields are excluded.
 - **Work-item links** are recreated once per link (directional links from the
   forward side, symmetric links from the lower-ID side) with IDs remapped.
-- Repos are pushed as explicit `refs/heads/*` and `refs/tags/*` refspecs —
-  Azure DevOps rejects pushes of its server-managed hidden refs
-  (`refs/pull/*`), so a raw `--mirror` push would fail.
+  Unsupported link types (`ArtifactLink` commit/build links, cross-org
+  remote links) are counted and reported, not silently dropped.
+- **Attachments** are re-uploaded (chunked above 100 MB).
+- **Repos** are recreated with their original names and default branches
+  (from `repos/index.json`) and pushed as explicit `refs/heads/*` and
+  `refs/tags/*` refspecs — Azure DevOps rejects pushes of its
+  server-managed hidden refs (`refs/pull/*`), so a raw `--mirror` push
+  would fail.
+- **Test plans**: configurations and variables are recreated by name, suites
+  parent-first (requirement suites remap their requirement ID; query suites
+  get their WIQL rewritten to the new project name), and test cases are added
+  only to static suites.
+- **Resume**: work items already in `id_map.<target>.json` are skipped, and
+  test plans that already exist by name are skipped, so a failed restore can
+  simply be re-run.
 
 ## Restore caveats
 
 Azure DevOps imposes some limitations that no third-party tool can work around:
 
-- **Work item IDs cannot be preserved.** New items get new IDs; the mapping is
-  written to `id_map.json` in the source directory after restore.
+- **Work item IDs cannot be preserved.** New items get new IDs; the mapping
+  is written to `id_map.<target>.json` in the source directory.
 - **Revision history cannot be replayed verbatim.** Only the final field
   values are restored. The full revision payload remains in the backup JSON,
   and a provenance comment (`Restored from work item #<old-id>`) is added to
   each restored item.
 - **Authors/timestamps** are set using `bypassRules=true` where the server
-  allows it; some collections will still rewrite them.
-- **Test runs / test points / results** are not restored — only the plans,
-  suites, and test-case associations. Requirement-based suites whose
-  requirement work item was not restored fall back to static suites.
-- **Query-based suites** keep their original query string, which may still
-  reference the old project name in path clauses — review after restore.
+  allows it; some collections will still rewrite them. The PAT identity
+  needs the "Bypass rules on work item updates" permission.
+- **Test runs / test points / results** are not restored.
+- **Old work item IDs inside field text** (descriptions, test case steps
+  referencing shared steps) are not rewritten.
 
-## Repository clones
+## Security notes
 
-Repos are cloned with `git clone --mirror`, so every ref (branches, tags,
-notes) is captured. Re-running a backup against an existing output directory
-performs a `git remote update --prune` instead of re-cloning.
-
-Git authentication uses a per-invocation `http.extraheader` — the PAT is
-**never written into the backup** (not in remote URLs, not in `.git/config`).
+- The PAT is never written into the backup: git authenticates through
+  environment-based config (`GIT_CONFIG_*`), keeping it out of remote URLs,
+  `.git/config` files, and the process table.
+- Attachment downloads are atomic (temp file + rename) and verified not to
+  be sign-in pages, so an expiring PAT cannot corrupt backed-up binaries.
 
 ## Development
 
 ```bash
-python -m pip install -e . pytest
+python -m pip install -e .[dev]
+ruff check azdo_backup tests
 pytest
 ```
 
-CI runs the test suite on Python 3.9 and 3.12 for every push and pull
-request (`.github/workflows/ci.yml`).
-
-## Logging
-
-Set `AZDO_BACKUP_LOG=DEBUG` to see request-level logs. Failures are
-non-fatal at the per-item level — the tool keeps going and logs the
-offending IDs so you can re-run targeted backups later.
+CI runs lint + tests on Python 3.9 and 3.12 for every push and pull request.
+Set `AZDO_BACKUP_LOG=DEBUG` for request-level logs.

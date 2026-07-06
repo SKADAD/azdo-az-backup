@@ -30,7 +30,10 @@ def get_logger(name: str = _ROOT_LOGGER_NAME) -> logging.Logger:
             logging.Formatter("%(asctime)s %(levelname)-5s %(name)s: %(message)s")
         )
         root.addHandler(handler)
-        root.setLevel(os.environ.get("AZDO_BACKUP_LOG", "INFO").upper())
+        level = os.environ.get("AZDO_BACKUP_LOG", "INFO").upper()
+        if level not in ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"):
+            level = "INFO"
+        root.setLevel(level)
         root.propagate = False
         _LOG_INITIALIZED = True
     if name != _ROOT_LOGGER_NAME and not name.startswith(_ROOT_LOGGER_NAME + "."):
@@ -83,11 +86,18 @@ def retry(
     return deco
 
 
-def run_git(cmd: list[str], check: bool = False) -> "subprocess.CompletedProcess[str]":
-    """Run a git command non-interactively (never prompt for credentials)."""
+def run_git(cmd: list[str], check: bool = False,
+            extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    """Run a git command non-interactively (never prompt for credentials).
+
+    ``extra_env`` carries credentials (e.g. ``git_auth_env()``) so they stay
+    out of the command line and the process table.
+    """
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
-    env["GIT_ASKPASS"] = "true"  # the no-op /usr/bin/true: fail instead of prompting
+    env["GIT_ASKPASS"] = "echo"  # portable no-op: auth fails instead of prompting
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(cmd, check=check, capture_output=True, text=True, env=env)
 
 
