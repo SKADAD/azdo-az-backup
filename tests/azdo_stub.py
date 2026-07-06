@@ -263,7 +263,8 @@ def _make_handler(state: StubState):
             if project.lower() == "alpha":
                 self._send({"value": [state.test_plan()]})
             else:
-                self._send({"value": []})
+                # Reflect what a restore created, so re-runs can resume.
+                self._send({"value": state.created_plans})
 
         def get_suites(self, project, plan_id):
             self._send({"value": state.suites()})

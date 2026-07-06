@@ -81,7 +81,33 @@ either way. Re-running a backup is incremental for git repos and attachments.
 
 Add `--archive` to also produce a single self-contained `<output>.zip` —
 an offline artifact containing everything (work item JSON, attachment
-binaries, git mirrors, test plans).
+binaries, git mirrors, test plans) plus a sha256 manifest
+(`checksums.json`). Use `--archive-path backups/contoso-2026-01-01.zip`
+to name the artifact (existing files are never overwritten, so dated
+rotation is safe).
+
+### Verify an archival backup (offline)
+
+```bash
+azdo-backup verify --source ./backups/contoso-2026-01-01.zip
+```
+
+No credentials needed. Checks zip integrity (CRCs), the sha256 manifest,
+the completion marker (`summary.json`, error-free), that every indexed
+work item and recorded attachment binary is present, and that every git
+mirror is a valid bare repository containing its default branch. Exit
+code 0 = trustworthy, 3 = problems found (listed in the JSON output).
+
+### Rehearse a restore
+
+```bash
+azdo-backup restore --source ./backups/contoso-2026-01-01.zip \
+  --project Contoso-Restored --dry-run
+```
+
+Runs verification and prints what would be created (work items,
+attachments, repos, test plans, process template) without credentials
+and without touching any organization.
 
 ### Restore a project
 
