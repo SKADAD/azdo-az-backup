@@ -52,6 +52,12 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--archive-path",
                    help="Where to write the archive (default: <output>.zip). "
                         "Refuses to overwrite an existing file.")
+    b.add_argument("--workers", type=int, default=4,
+                   help="Concurrent work item fetches (default: 4). Raise for "
+                        "large projects; lower if you hit rate limits.")
+    b.add_argument("--exclude-projects", default="",
+                   help="Comma-separated project names to skip in "
+                        "--all-projects mode.")
 
     # restore
     r = sub.add_parser("restore", help="Restore a backed-up project (or a whole "
@@ -99,11 +105,14 @@ def _cmd_backup(client: AzDoClient, args: argparse.Namespace) -> int:
     from .backup import backup_org, backup_project
     out = Path(args.output)
     if args.all_projects:
-        stats = backup_org(client, out)
+        excluded = {n for n in args.exclude_projects.split(",") if n.strip()}
+        stats = backup_org(client, out, workers=args.workers,
+                           exclude_projects=excluded)
     else:
         # Same layout as org backups so restore instructions are uniform.
         proj_dir = out / "projects" / safe_filename(args.project)
-        stats = backup_project(client, args.project, proj_dir)
+        stats = backup_project(client, args.project, proj_dir,
+                               workers=args.workers)
     if args.archive or args.archive_path:
         from .verify import write_checksums
         write_checksums(out)

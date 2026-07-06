@@ -158,7 +158,7 @@ def restore_result(stub, backup_result):
 def test_restore_exit_code_and_project_created(restore_result):
     rc, state, _ = restore_result
     assert rc == 0
-    assert state.beta_created
+    assert "beta" in state.created_projects
 
 
 def test_restore_work_items_with_remapped_fields(restore_result):
@@ -265,5 +265,5 @@ def test_restore_id_map_written_next_to_archive(restore_result):
     _, _, zip_path = restore_result
     id_map_file = zip_path.parent / "id_map.Beta.json"
     assert id_map_file.is_file()
-    id_map = json.loads(id_map_file.read_text())
-    assert set(id_map) == {"1", "2", "3"}
+    state_raw = json.loads(id_map_file.read_text())
+    assert set(state_raw["map"]) == {"1", "2", "3"}
