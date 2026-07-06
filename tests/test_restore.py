@@ -1,5 +1,3 @@
-import json
-
 from azdo_backup.restore import _fields_to_patch, _find_attachment_file
 
 

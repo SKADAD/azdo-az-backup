@@ -4,13 +4,26 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "azdo-az-backup"
-version = "0.3.0"
+version = "0.4.0"
 description = "Backup and restore Azure DevOps projects and organizations."
+readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.9"
 dependencies = ["requests>=2.31"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
 
 [project.scripts]
 azdo-backup = "azdo_backup.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["azdo_backup*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+ignore = ["E501", "UP006", "UP007", "UP035", "UP045"]

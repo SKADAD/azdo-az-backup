@@ -34,13 +34,13 @@ def test_full_url_with_and_without_project():
     assert c._full_url(passthrough) == passthrough
 
 
-def test_git_auth_args_do_not_contain_raw_pat():
+def test_git_auth_env_do_not_contain_raw_pat():
     c = make_client()
-    args = c.git_auth_args()
-    assert args[0] == "-c"
-    assert "secret-pat" not in " ".join(args)
+    env = c.git_auth_env()
+    assert env["GIT_CONFIG_KEY_0"] == "http.extraheader"
+    assert "secret-pat" not in env["GIT_CONFIG_VALUE_0"]
     expected = base64.b64encode(b":secret-pat").decode()
-    assert expected in args[1]
+    assert expected in env["GIT_CONFIG_VALUE_0"]
 
 
 def test_strip_url_credentials():

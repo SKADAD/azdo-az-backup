@@ -1,5 +1,4 @@
 """Tests for relation deduplication during restore."""
-from azdo_backup.client import AzDoClient
 from azdo_backup.restore import _restore_relations
 
 
