@@ -11,7 +11,7 @@ from azdo_backup.client import AzDoError
 @pytest.fixture(autouse=True)
 def fake_client(monkeypatch):
     class FakeClient:
-        def __init__(self, org, pat=None):
+        def __init__(self, org, pat=None, **kw):
             self.org_name = "myorg"
 
         def list_projects(self):

@@ -245,6 +245,32 @@ Azure DevOps imposes some limitations that no third-party tool can work around:
 - **Old work item IDs inside field text** (descriptions, test case steps
   referencing shared steps) are not rewritten.
 
+## Azure DevOps rate limits
+
+Azure DevOps enforces a [global consumption limit](https://learn.microsoft.com/en-us/azure/devops/integrate/concepts/rate-limits?view=azure-devops)
+of **200 TSTUs per identity in a sliding 5-minute window**. Exceed it and
+your requests get delayed (you receive a warning email) or blocked with
+HTTP 429. Bulk backups are exactly the kind of workload that trips this.
+
+The client self-paces automatically: every response's
+`X-RateLimit-Remaining` / `X-RateLimit-Limit` / `Retry-After` headers
+(which the service sends *before* it starts delaying — including
+`Retry-After` on HTTP 200) feed an adaptive throttle shared across all
+worker threads. As the TSTU budget depletes, requests are spaced out
+(0.5s → 2s → 5s per request), and server-imposed delays trigger a stronger
+backoff. Pacing relaxes automatically when consumption recovers. A warning
+is logged when throttling engages.
+
+For long archival jobs you can be gentler still:
+
+- `--max-rps 5` — hard cap on REST requests per second (all commands).
+- `--workers 2` — fewer concurrent work item fetches.
+- `--repo-delay 30` — pause between git clone/fetch operations; **git
+  traffic counts toward the same consumption limit**, and cloning many
+  repos back-to-back is a common way to trip it.
+- Microsoft's escape hatch: assigning the backup identity the
+  **Basic + Test Plans** access level temporarily raises its limits.
+
 ## Security notes
 
 - The PAT is never written into the backup: git authenticates through

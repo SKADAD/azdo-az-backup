@@ -38,10 +38,107 @@ class AzDoAuthError(AzDoError):
     """The service answered with a sign-in page instead of data."""
 
 
+class AdaptiveThrottle:
+    """Client-side pacing that reacts to Azure DevOps rate-limit headers.
+
+    Azure DevOps enforces a global consumption limit (200 TSTUs per identity
+    in a sliding 5-minute window). It sends ``X-RateLimit-Limit`` /
+    ``X-RateLimit-Remaining`` / ``Retry-After`` *before* it starts delaying
+    requests, so a well-behaved client can slow down proactively instead of
+    being throttled server-side. ``Retry-After`` can arrive on an HTTP 200 —
+    it means "wait this long before your next request".
+
+    Thread-safe: one instance is shared by all worker threads, so pressure
+    seen by one thread slows everyone down.
+    """
+
+    def __init__(self, max_rps: float | None = None):
+        self._lock = threading.Lock()
+        self._floor_spacing = (1.0 / max_rps) if max_rps and max_rps > 0 else 0.0
+        self._spacing = self._floor_spacing   # min seconds between requests
+        self._not_before = 0.0                # monotonic gate from Retry-After
+        self._next_slot = 0.0
+        self._last_warn = 0.0
+        self._pressured = False
+
+    def wait(self) -> None:
+        """Block until this thread may send its next request."""
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._not_before, self._next_slot)
+            self._next_slot = start + self._spacing
+            delay = start - now
+        if delay > 0:
+            time.sleep(delay)
+
+    def update(self, headers) -> None:
+        """Adjust pacing from a response's rate-limit headers.
+
+        When the headers are absent (consumption is fine) pacing decays back
+        to the configured floor automatically.
+        """
+        retry_after = headers.get("Retry-After")
+        limit = headers.get("X-RateLimit-Limit")
+        remaining = headers.get("X-RateLimit-Remaining")
+        delay_hdr = headers.get("X-RateLimit-Delay")
+
+        spacing = self._floor_spacing
+        ratio = None
+        try:
+            if limit is not None and remaining is not None and float(limit) > 0:
+                ratio = max(0.0, float(remaining)) / float(limit)
+                if ratio < 0.10:
+                    spacing = max(spacing, 5.0)
+                elif ratio < 0.25:
+                    spacing = max(spacing, 2.0)
+                elif ratio < 0.50:
+                    spacing = max(spacing, 0.5)
+        except ValueError:
+            pass
+        try:
+            if delay_hdr and float(delay_hdr) > 0:
+                # The server is already delaying us — back off harder.
+                spacing = max(spacing, min(float(delay_hdr) * 2.0, 30.0))
+        except ValueError:
+            pass
+
+        with self._lock:
+            self._spacing = spacing
+            pressured = spacing > self._floor_spacing
+            if pressured:
+                # Under pressure the very next request pays the delay too.
+                self._next_slot = max(self._next_slot,
+                                      time.monotonic() + spacing)
+            elif self._pressured:
+                # Pressure just cleared — drop the residual gate.
+                self._next_slot = min(self._next_slot,
+                                      time.monotonic() + spacing)
+            self._pressured = pressured
+            if retry_after is not None:
+                try:
+                    pause = min(float(retry_after), 300.0)
+                    self._not_before = max(self._not_before,
+                                           time.monotonic() + pause)
+                except ValueError:
+                    pass
+            engaged = spacing > self._floor_spacing or retry_after is not None
+            now = time.monotonic()
+            should_warn = engaged and now - self._last_warn > 60
+            if should_warn:
+                self._last_warn = now
+        if should_warn:
+            log.warning(
+                "Azure DevOps rate-limit pressure detected "
+                "(remaining/limit=%s/%s, Retry-After=%s) — pacing requests "
+                "by %.1fs to avoid server-side throttling",
+                remaining, limit, retry_after, spacing)
+
+
 class AzDoClient:
     """Thin wrapper around the Azure DevOps REST API."""
 
-    def __init__(self, org_url: str, pat: str | None = None, timeout: float = 60.0):
+    def __init__(self, org_url: str, pat: str | None = None,
+                 timeout: float = 60.0, max_rps: float | None = None):
         if not org_url:
             raise ValueError("org_url is required")
         # Normalize: ensure trailing slash, accept either https://dev.azure.com/org or https://org.visualstudio.com
@@ -61,6 +158,7 @@ class AzDoClient:
             "Accept": "application/json",
         }
         self._local = threading.local()
+        self.throttle = AdaptiveThrottle(max_rps=max_rps)
 
     @property
     def session(self) -> requests.Session:
@@ -144,6 +242,7 @@ class AzDoClient:
             backoff = min(30.0, 2.0 ** (attempt - 1))
             if hasattr(data, "seek"):
                 data.seek(0)  # replaying a consumed file object sends an empty body
+            self.throttle.wait()
             try:
                 resp = self.session.request(
                     method, url,
@@ -157,6 +256,11 @@ class AzDoClient:
                     time.sleep(backoff)
                     continue
                 raise AzDoError(f"network error for {method} {url}: {exc}") from exc
+
+            # React to rate-limit headers on EVERY response — Azure DevOps
+            # sends them (including Retry-After on HTTP 200) before it starts
+            # delaying, so pacing here prevents server-side throttling.
+            self.throttle.update(resp.headers)
 
             if resp.status_code == 429:
                 if attempt < tries:

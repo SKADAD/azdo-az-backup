@@ -31,6 +31,7 @@ import json
 import os
 import shutil
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -81,7 +82,8 @@ def _write_json(path: Path, data) -> None:
 
 def backup_org(client: AzDoClient, output_dir: str | os.PathLike,
                *, workers: int = 4,
-               exclude_projects: set[str] | None = None) -> BackupStats:
+               exclude_projects: set[str] | None = None,
+               repo_delay: float = 0.0) -> BackupStats:
     out = ensure_dir(output_dir)
     stats = BackupStats()
     excluded = {name.strip().lower() for name in (exclude_projects or set())}
@@ -101,7 +103,8 @@ def backup_org(client: AzDoClient, output_dir: str | os.PathLike,
         try:
             backup_project(client, proj["name"],
                            projects_dir / safe_filename(proj["name"]),
-                           stats=stats, workers=workers)
+                           stats=stats, workers=workers,
+                           repo_delay=repo_delay)
             stats.add("projects_backed_up")
         except AzDoAuthError:
             raise  # credentials are gone; every further call would fail too
@@ -114,7 +117,7 @@ def backup_org(client: AzDoClient, output_dir: str | os.PathLike,
 def backup_project(client: AzDoClient, project: str,
                    output_dir: str | os.PathLike,
                    stats: BackupStats | None = None,
-                   *, workers: int = 4) -> BackupStats:
+                   *, workers: int = 4, repo_delay: float = 0.0) -> BackupStats:
     out = ensure_dir(output_dir)
     stats = stats if stats is not None else BackupStats()
     log.info("Backing up project '%s' into %s", project, out)
@@ -137,7 +140,8 @@ def backup_project(client: AzDoClient, project: str,
     _backup_classification_nodes(client, project, out, stats)
     _backup_work_items(client, project, out / "work_items", stats,
                        workers=workers)
-    _backup_repos(client, project, out / "repos", stats)
+    _backup_repos(client, project, out / "repos", stats,
+                  repo_delay=repo_delay)
     _backup_test_plans(client, project, out / "test_plans", stats)
 
     _write_json(out / "summary.json", stats.as_dict())
@@ -410,7 +414,7 @@ def _is_bare_repo(path: Path) -> bool:
 
 
 def _backup_repos(client: AzDoClient, project: str, out: Path,
-                  stats: BackupStats) -> None:
+                  stats: BackupStats, *, repo_delay: float = 0.0) -> None:
     ensure_dir(out)
     repos = client.get_json("_apis/git/repositories", project=project).get("value", [])
     dirs = _repo_backup_dirs(repos)
@@ -427,6 +431,7 @@ def _backup_repos(client: AzDoClient, project: str, out: Path,
             shutil.rmtree(d, ignore_errors=True)
             stats.add("repos_pruned")
     auth_env = client.git_auth_env()
+    first = True
     for repo in repos:
         name = repo["name"]
         if repo.get("isDisabled"):
@@ -439,6 +444,13 @@ def _backup_repos(client: AzDoClient, project: str, out: Path,
             stats.error(f"[{project}] repo '{name}' has no remoteUrl, skipping")
             continue
         remote = client.strip_url_credentials(remote)
+        # Git traffic counts toward the Azure DevOps consumption limit;
+        # cloning many repos back-to-back is a common way to trip it.
+        if not first and repo_delay > 0:
+            log.info("[%s] pausing %.1fs before next repo (--repo-delay)",
+                     project, repo_delay)
+            time.sleep(repo_delay)
+        first = False
         target = out / repo["backup_dir"]
         if target.exists() and not _is_bare_repo(target):
             log.warning("[%s] '%s' is not a valid bare repo (interrupted clone?) "
