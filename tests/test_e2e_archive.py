@@ -306,3 +306,44 @@ def test_incremental_backup_prunes_deleted_items(stub, tmp_path):
     # The genuine content is untouched.
     assert (proj / "work_items" / "1.json").exists()
     assert (proj / "repos" / "web.git").is_dir()
+
+
+# ---------------------------------------------------------------- skip repos
+
+
+def test_backup_skip_repos_excludes_git(stub, tmp_path):
+    _, base_url = stub
+    out = tmp_path / "norepos"
+    rc = cli.main(["backup", "--org", f"{base_url}/myorg", "--pat", "t",
+                   "--project", "Alpha", "-o", str(out), "--skip-repos"])
+    assert rc == 0
+    proj = out / "projects" / "Alpha"
+    assert not (proj / "repos").exists()
+    summary = json.loads((proj / "summary.json").read_text())
+    assert summary["error_count"] == 0
+    assert summary["counts"]["work_items"] == 3
+    assert summary["counts"]["repos_skipped_by_flag"] == 1
+    assert "repos" not in summary["counts"]
+    # The manifest records the exclusion — archives stay self-describing.
+    manifest = json.loads((proj / "manifest.json").read_text())
+    assert manifest["repos_included"] is False
+    # The backup still verifies clean and restores (repos step is a no-op).
+    assert verify_backup(out).ok
+
+
+def test_skip_repos_rerun_keeps_existing_mirrors(stub, tmp_path):
+    """Skipping repos on an incremental re-run must not prune mirrors a
+    previous full backup created."""
+    _, base_url = stub
+    out = tmp_path / "keepmirrors"
+    base = ["backup", "--org", f"{base_url}/myorg", "--pat", "t",
+            "--project", "Alpha", "-o", str(out)]
+    assert cli.main(base) == 0  # full backup, clones web.git
+    mirror = out / "projects" / "Alpha" / "repos" / "web.git"
+    assert mirror.is_dir()
+
+    assert cli.main([*base, "--skip-repos"]) == 0
+    assert mirror.is_dir(), "existing mirror must survive a --skip-repos run"
+    manifest = json.loads(
+        (out / "projects" / "Alpha" / "manifest.json").read_text())
+    assert manifest["repos_included"] is False  # reflects the LATEST run
