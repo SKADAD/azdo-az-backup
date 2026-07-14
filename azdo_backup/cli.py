@@ -28,6 +28,11 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--pat", default=None,
                    help="Personal Access Token (defaults to $AZURE_DEVOPS_EXT_PAT "
                         "or $AZDO_PAT).")
+    p.add_argument("--max-rps", type=float, default=None,
+                   help="Hard cap on REST requests per second (e.g. 5). The "
+                        "client always self-paces adaptively from the "
+                        "service's X-RateLimit headers; use this to stay "
+                        "gentler still, e.g. for background archival jobs.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,6 +63,10 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--exclude-projects", default="",
                    help="Comma-separated project names to skip in "
                         "--all-projects mode.")
+    b.add_argument("--repo-delay", type=float, default=0.0,
+                   help="Seconds to pause between git clone/fetch operations "
+                        "— git traffic counts toward the Azure DevOps "
+                        "consumption limit too (default: 0).")
 
     # restore
     r = sub.add_parser("restore", help="Restore a backed-up project (or a whole "
@@ -107,12 +116,14 @@ def _cmd_backup(client: AzDoClient, args: argparse.Namespace) -> int:
     if args.all_projects:
         excluded = {n for n in args.exclude_projects.split(",") if n.strip()}
         stats = backup_org(client, out, workers=args.workers,
-                           exclude_projects=excluded)
+                           exclude_projects=excluded,
+                           repo_delay=args.repo_delay)
     else:
         # Same layout as org backups so restore instructions are uniform.
         proj_dir = out / "projects" / safe_filename(args.project)
         stats = backup_project(client, args.project, proj_dir,
-                               workers=args.workers)
+                               workers=args.workers,
+                               repo_delay=args.repo_delay)
     if args.archive or args.archive_path:
         from .verify import write_checksums
         write_checksums(out)
@@ -262,7 +273,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_restore(None, args)
 
         try:
-            client = AzDoClient(args.org, pat=args.pat)
+            client = AzDoClient(args.org, pat=args.pat,
+                                max_rps=getattr(args, "max_rps", None))
         except AzDoError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_USAGE
