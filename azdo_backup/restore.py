@@ -76,6 +76,23 @@ def _read_json(path: Path) -> Any:
         return json.load(f)
 
 
+class RestoreStats:
+    """Collects non-fatal restore errors so a lossy restore is detectable
+    (mirrors BackupStats: error_count lands in the summary and drives the
+    CLI exit code)."""
+
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+        self.counts: dict[str, int] = {}
+
+    def error(self, message: str) -> None:
+        self.errors.append(message)
+        log.error("%s", message)
+
+    def add(self, key: str, n: int = 1) -> None:
+        self.counts[key] = self.counts.get(key, 0) + n
+
+
 # --------------------------------------------------------------------- top level
 
 
@@ -121,16 +138,18 @@ def restore_project(
         log.info("Loaded existing id map (%d entries, %d fully restored) — "
                  "restore will resume", len(id_map), len(pass2_done))
 
+    stats = RestoreStats()
     if not skip_work_items and (src / "work_items").exists():
         id_map = _restore_work_items(client, new_project_name, src / "work_items",
                                      old_project=old_project_name, id_map=id_map,
                                      pass2_done=pass2_done,
-                                     id_map_path=id_map_path)
+                                     id_map_path=id_map_path, stats=stats)
         summary["work_items_mapped"] = len(id_map)
         summary["id_map_file"] = str(id_map_path)
 
     if not skip_repos and (src / "repos").exists():
-        summary["repos_pushed"] = _restore_repos(client, new_project_name, src / "repos")
+        summary["repos_pushed"] = _restore_repos(client, new_project_name,
+                                                 src / "repos", stats=stats)
 
     if not skip_test_plans and (src / "test_plans").exists():
         if skip_work_items and not id_map:
@@ -139,9 +158,12 @@ def restore_project(
                         "restore first, or keep its id_map file)")
         summary["test_plans_restored"] = _restore_test_plans(
             client, new_project_name, src / "test_plans", id_map,
-            old_project=old_project_name,
+            old_project=old_project_name, stats=stats,
         )
 
+    summary["counts"] = stats.counts
+    summary["error_count"] = len(stats.errors)
+    summary["errors"] = stats.errors
     return summary
 
 
@@ -302,17 +324,36 @@ def _ensure_classification_nodes(client: AzDoClient, project: str,
 # --------------------------------------------------------------------- work items
 
 
+def _target_work_item_types(client: AzDoClient, project: str) -> set[str] | None:
+    """Lowercased work item type names available in the target project,
+    or None if the listing fails (skip the preflight in that case)."""
+    try:
+        types = client.get_json("_apis/wit/workitemtypes", project=project)
+        return {t["name"].strip().lower() for t in types.get("value", [])}
+    except (AzDoError, KeyError) as exc:
+        log.warning("[%s] could not list work item types (%s) — skipping "
+                    "type preflight", project, exc)
+        return None
+
+
 def _restore_work_items(client: AzDoClient, project: str, src: Path,
                         *, old_project: str,
                         id_map: dict[int, int] | None = None,
                         pass2_done: set[int] | None = None,
-                        id_map_path: Path | None = None) -> dict[int, int]:
+                        id_map_path: Path | None = None,
+                        stats: RestoreStats | None = None) -> dict[int, int]:
     idx = _read_json(src / "index.json")
     ids = idx["ids"]
     id_map = dict(id_map or {})
     pass2_done = set(pass2_done or set())
+    stats = stats if stats is not None else RestoreStats()
     log.info("[%s] restoring %d work items (%d already mapped)",
              project, len(ids), len(id_map))
+
+    # Preflight: restoring into a different process (e.g. Scrum -> Agile)
+    # makes every item of a missing type fail three API calls in a row —
+    # detect those types once instead.
+    target_types = _target_work_item_types(client, project)
 
     # Pass 0: recreate the classification tree. Prefer the full backed-up
     # tree (keeps iteration dates and empty nodes); infer from work item
@@ -341,6 +382,7 @@ def _restore_work_items(client: AzDoClient, project: str, src: Path,
     _ensure_classification_nodes(client, project, "iterations", iteration_paths)
 
     # Pass 1: create items with primitive fields only.
+    missing_types: Counter = Counter()
     for old_id in ids:
         if old_id in id_map:
             continue  # already restored by a previous (partial) run
@@ -356,10 +398,22 @@ def _restore_work_items(client: AzDoClient, project: str, src: Path,
         if wit.strip().lower() in _TEST_MANAGED_TYPES:
             # Created by the Test Plans restore, not the WIT API.
             continue
+        if target_types is not None and wit.strip().lower() not in target_types:
+            missing_types[wit] += 1
+            continue
         created = _create_work_item(client, project, wit, fields,
                                     old_project=old_project, old_id=old_id)
         if created:
             id_map[old_id] = created["id"]
+            stats.add("work_items_created")
+        else:
+            stats.error(f"[{project}] could not create work item "
+                        f"(old id {old_id}, type {wit})")
+
+    for wit, count in missing_types.items():
+        stats.error(f"[{project}] {count} work item(s) of type '{wit}' skipped "
+                    "— the type does not exist in the target process "
+                    "(use --process to match the source process)")
 
     # Persist the map before pass 2: a crash there must not cause the next
     # run to recreate (duplicate) all the items pass 1 already made.
@@ -377,7 +431,7 @@ def _restore_work_items(client: AzDoClient, project: str, src: Path,
         new_id = id_map[old_id]
         wi = _read_json(src / f"{old_id}.json")
         _enrich_work_item(client, project, src, wi, old_id, new_id, id_map,
-                          dropped_relations)
+                          dropped_relations, stats)
         pass2_done.add(old_id)
         # Persist progress so an interrupt resumes where it left off.
         if id_map_path is not None and (i % 25 == 0 or i == len(pending)):
@@ -402,14 +456,16 @@ def remap_steps_comprefs(steps_xml: str, id_map: dict[int, int]) -> str:
 
 def _enrich_work_item(client: AzDoClient, project: str, src: Path, wi: dict,
                       old_id: int, new_id: int, id_map: dict[int, int],
-                      dropped_relations: Counter) -> None:
+                      dropped_relations: Counter,
+                      stats: RestoreStats | None = None) -> None:
     """Pass 2 for one item: relations, attachments, comments, steps refs."""
+    stats = stats if stats is not None else RestoreStats()
     try:
         _restore_relations(client, project, src.parent, wi, new_id, id_map,
-                           dropped_relations)
+                           dropped_relations, stats=stats)
     except Exception as exc:
-        log.error("[%s] relations for WI %s->%s failed: %s",
-                  project, old_id, new_id, exc)
+        stats.error(f"[{project}] relations for WI {old_id}->{new_id} "
+                    f"failed: {exc}")
 
     # Test case steps reference shared-steps work items by their OLD id.
     steps = (wi.get("fields") or {}).get("Microsoft.VSTS.TCM.Steps")
@@ -540,8 +596,10 @@ def _relation_attributes(rel: dict) -> dict:
 
 def _restore_relations(client: AzDoClient, project: str, backup_root: Path,
                        wi: dict, new_id: int, id_map: dict[int, int],
-                       dropped: Counter | None = None) -> None:
+                       dropped: Counter | None = None,
+                       stats: RestoreStats | None = None) -> None:
     dropped = dropped if dropped is not None else Counter()
+    stats = stats if stats is not None else RestoreStats()
     patches: list[dict] = []
     for rel in wi.get("relations", []) or []:
         rel_type = rel.get("rel")
@@ -556,7 +614,7 @@ def _restore_relations(client: AzDoClient, project: str, backup_root: Path,
             try:
                 new_url = client.upload_attachment(project, local, name or local.name)
             except Exception as exc:
-                log.error("[%s] upload attachment %s failed: %s", project, name, exc)
+                stats.error(f"[{project}] upload attachment {name} failed: {exc}")
                 continue
             patches.append({
                 "op": "add", "path": "/relations/-",
@@ -614,14 +672,17 @@ def _restore_relations(client: AzDoClient, project: str, backup_root: Path,
                 client.patch_json(f"_apis/wit/workitems/{new_id}", [p],
                                   project=project, params=params)
             except AzDoError as exc:
-                log.error("[%s] relation %s on WI %s failed: %s",
-                          project, (p.get("value") or {}).get("rel"), new_id, exc)
+                stats.error(f"[{project}] relation "
+                            f"{(p.get('value') or {}).get('rel')} on WI "
+                            f"{new_id} failed: {exc}")
 
 
 # --------------------------------------------------------------------- repos
 
 
-def _restore_repos(client: AzDoClient, project: str, src: Path) -> int:
+def _restore_repos(client: AzDoClient, project: str, src: Path,
+                   stats: RestoreStats | None = None) -> int:
+    stats = stats if stats is not None else RestoreStats()
     # index.json maps backup dirs to original names and default branches.
     repo_meta: dict[str, dict] = {}
     index_file = src / "index.json"
@@ -648,11 +709,11 @@ def _restore_repos(client: AzDoClient, project: str, src: Path) -> int:
                 new_repo = client.get_json(
                     f"_apis/git/repositories/{quote(name, safe='')}", project=project)
             else:
-                log.error("[%s] create repo '%s' failed: %s", project, name, exc)
+                stats.error(f"[{project}] create repo '{name}' failed: {exc}")
                 continue
         remote = new_repo.get("remoteUrl")
         if not remote:
-            log.error("[%s] repo '%s' has no remoteUrl after creation", project, name)
+            stats.error(f"[{project}] repo '{name}' has no remoteUrl after creation")
             continue
         push_url = client.strip_url_credentials(remote)
         # Push branches and tags explicitly rather than --mirror: mirrors of
@@ -663,10 +724,11 @@ def _restore_repos(client: AzDoClient, project: str, src: Path) -> int:
         log.info("[%s] pushing branches/tags for '%s'", project, name)
         res = run_git(cmd, extra_env=auth_env)
         if res.returncode != 0:
-            log.error("[%s] push '%s' failed (exit %d): %s", project, name,
-                      res.returncode, (res.stderr or "").strip()[:500])
+            stats.error(f"[{project}] push '{name}' failed (exit "
+                        f"{res.returncode}): {(res.stderr or '').strip()[:500]}")
             continue
         pushed += 1
+        stats.add("repos_pushed")
         default_branch = meta.get("defaultBranch")
         if default_branch:
             try:
@@ -752,7 +814,9 @@ def _order_suites_parents_first(suites: list[dict]) -> list[dict]:
 
 
 def _restore_test_plans(client: AzDoClient, project: str, src: Path,
-                        wi_id_map: dict[int, int], *, old_project: str) -> int:
+                        wi_id_map: dict[int, int], *, old_project: str,
+                        stats: RestoreStats | None = None) -> int:
+    stats = stats if stats is not None else RestoreStats()
     if not (src / "index.json").exists():
         return 0
     plans = _read_json(src / "index.json").get("plans", [])
@@ -800,8 +864,8 @@ def _restore_test_plans(client: AzDoClient, project: str, src: Path,
                 api_version="7.1-preview.1",
             )
         except AzDoError as exc:
-            log.error("[%s] create test plan '%s' failed: %s",
-                      project, plan.get("name"), exc)
+            stats.error(f"[{project}] create test plan '{plan.get('name')}' "
+                        f"failed: {exc}")
             continue
         new_plan_id = new_plan["id"]
         suites_dir = plan_dir / "suites"
@@ -858,8 +922,8 @@ def _restore_test_plans(client: AzDoClient, project: str, src: Path,
                     if effective_type.lower() == "statictestsuite":
                         static_suites.add(new_s["id"])
                 except AzDoError as exc:
-                    log.error("[%s] create suite '%s' under plan %s failed: %s",
-                              project, s.get("name"), new_plan_id, exc)
+                    stats.error(f"[{project}] create suite '{s.get('name')}' "
+                                f"under plan {new_plan_id} failed: {exc}")
 
             # Add test cases — only to static suites (query suites are
             # query-driven and requirement suites populate from links).
@@ -885,7 +949,7 @@ def _restore_test_plans(client: AzDoClient, project: str, src: Path,
                         body, project=project, api_version="7.1-preview.3",
                     )
                 except AzDoError as exc:
-                    log.error("[%s] add test cases to suite %s failed: %s",
-                              project, new_suite_id, exc)
+                    stats.error(f"[{project}] add test cases to suite "
+                                f"{new_suite_id} failed: {exc}")
         restored += 1
     return restored

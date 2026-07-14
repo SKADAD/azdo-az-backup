@@ -211,6 +211,7 @@ def _backup_work_items(client: AzDoClient, project: str, out: Path,
 
     attachments_root = ensure_dir(out / "attachments")
     saved: set[int] = set()
+    processed = 0
     workers = max(1, workers)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for batch in chunks(ids, 200):
@@ -243,11 +244,39 @@ def _backup_work_items(client: AzDoClient, project: str, out: Path,
                 except Exception as exc:
                     stats.error(f"[{project}] work item {wi.get('id')} "
                                 f"failed: {exc}")
+                processed += 1
+                if processed % 500 == 0:
+                    log.info("[%s] progress: %d/%d work items",
+                             project, processed, len(ids))
 
     missing = sorted(set(ids) - saved)
     if missing:
         stats.error(f"[{project}] {len(missing)} indexed work items were not "
                     f"saved (deleted mid-run or fetch failures): {missing[:50]}")
+
+    _prune_orphans(out, attachments_root, set(ids), project, stats)
+
+
+def _prune_orphans(out: Path, attachments_root: Path, valid_ids: set[int],
+                   project: str, stats: BackupStats) -> None:
+    """Remove work item files/attachments for items deleted from the org.
+
+    Incremental backup dirs otherwise accumulate orphans forever — and
+    carry them into every future archive.
+    """
+    for f in out.glob("*.json"):
+        if f.stem.isdigit() and int(f.stem) not in valid_ids:
+            f.unlink()
+            stats.add("work_items_pruned")
+    if attachments_root.is_dir():
+        for d in attachments_root.iterdir():
+            if d.is_dir() and d.name.isdigit() and int(d.name) not in valid_ids:
+                shutil.rmtree(d, ignore_errors=True)
+                stats.add("attachment_dirs_pruned")
+    pruned = stats.counts.get("work_items_pruned", 0)
+    if pruned:
+        log.info("[%s] pruned %d work item file(s) no longer in the org",
+                 project, pruned)
 
 
 def _work_item_unchanged(out: Path, wi: dict) -> bool:
@@ -389,6 +418,14 @@ def _backup_repos(client: AzDoClient, project: str, out: Path,
         repo["backup_dir"] = dirs.get(repo["id"])
     _write_json(out / "index.json", {"project": project, "repos": repos})
     log.info("[%s] %d git repos", project, len(repos))
+    # Prune mirrors of repos that no longer exist in the org.
+    expected_dirs = set(dirs.values())
+    for d in out.iterdir():
+        if d.is_dir() and d.name.endswith(".git") and d.name not in expected_dirs:
+            log.info("[%s] pruning mirror '%s' (repo no longer in org)",
+                     project, d.name)
+            shutil.rmtree(d, ignore_errors=True)
+            stats.add("repos_pruned")
     auth_env = client.git_auth_env()
     for repo in repos:
         name = repo["name"]

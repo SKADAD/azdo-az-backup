@@ -207,6 +207,10 @@ def _cmd_restore(client: AzDoClient | None, args: argparse.Namespace) -> int:
             proj_src = _resolve_project_source(src, args.source_project)
             summary = restore_project(client, proj_src, args.project, **common)
             print(json.dumps(summary, indent=2))
+            if summary.get("error_count"):
+                print(f"Restore finished with {summary['error_count']} "
+                      "error(s) — see the summary above", file=sys.stderr)
+                return EXIT_PARTIAL
             return EXIT_OK
 
         projects_dir = src / "projects" if (src / "projects").is_dir() else src
@@ -222,7 +226,9 @@ def _cmd_restore(client: AzDoClient | None, args: argparse.Namespace) -> int:
             original = json.loads((proj_src / "project.json").read_text(encoding="utf-8"))
             target = args.prefix + (original.get("name") or proj_src.name)
             try:
-                summaries.append(restore_project(client, proj_src, target, **common))
+                summary = restore_project(client, proj_src, target, **common)
+                failures += 1 if summary.get("error_count") else 0
+                summaries.append(summary)
             except AzDoError as exc:
                 failures += 1
                 log.error("restore of '%s' failed: %s", target, exc)

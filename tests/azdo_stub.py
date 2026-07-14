@@ -287,6 +287,11 @@ def _make_handler(state: StubState):
         def get_processes(self):
             self._send({"value": [{"id": "tpl-agile", "name": "Agile"}]})
 
+        def get_work_item_types(self, project):
+            self._send({"value": [{"name": n} for n in
+                        ("Bug", "User Story", "Task", "Test Case",
+                         "Shared Steps", "Feature", "Epic")]})
+
         def get_operation(self, op_id):
             self._send({"id": op_id, "status": "succeeded"})
 
@@ -395,6 +400,8 @@ def _make_handler(state: StubState):
             (P + r"/_apis/projects/([^/]+)", Handler.get_project),
             (P + r"/_apis/process/processes", Handler.get_processes),
             (P + r"/_apis/operations/([^/]+)", Handler.get_operation),
+            (P + r"/([^/]+)/_apis/wit/workitemtypes",
+             Handler.get_work_item_types),
             (P + r"/([^/]+)/_apis/wit/classificationnodes/([^/]+)",
              Handler.get_classification),
             (P + r"/([^/]+)/_apis/wit/workItems/(\d+)/revisions",

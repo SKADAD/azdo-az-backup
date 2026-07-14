@@ -83,7 +83,9 @@ and unchanged work items.
 Work items are fetched with 4 concurrent workers by default; use
 `--workers N` to raise it for large projects (or lower it when hitting
 rate limits). In `--all-projects` mode, `--exclude-projects "Sandbox,Temp"`
-skips projects you don't want in the archive.
+skips projects you don't want in the archive. Incremental re-runs prune
+work items, attachments and repo mirrors that were deleted in the org,
+so long-lived backup directories mirror the current state.
 
 Add `--archive` to also produce a single self-contained `<output>.zip` —
 an offline artifact containing everything (work item JSON, attachment
@@ -154,6 +156,10 @@ source project's process; override with `--process`.
 | 2    | usage error |
 | 3    | finished, but with per-item errors (see `summary.json` / output) |
 
+Restores report the same way: the summary JSON carries `error_count` and
+the full error list, and any lossy restore (failed items, attachments,
+pushes, suites) exits 3 instead of masquerading as success.
+
 ## On-disk layout
 
 ```
@@ -197,6 +203,8 @@ incomplete — the file is written only after everything else finished.
   that doesn't exist in the target process), retried without state fields,
   then with a minimal field set — so the item is never silently lost.
   Board-scoped `WEF_*` fields and server-managed fields are excluded.
+  Work item types missing from the target process (cross-process restores)
+  are detected up front and reported as one aggregated error per type.
 - **Work-item links** are recreated once per link (directional links from the
   forward side, symmetric links from the lower-ID side) with IDs remapped.
   Unsupported link types (`ArtifactLink` commit/build links, cross-org
