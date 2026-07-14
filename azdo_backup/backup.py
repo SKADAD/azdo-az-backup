@@ -83,7 +83,8 @@ def _write_json(path: Path, data) -> None:
 def backup_org(client: AzDoClient, output_dir: str | os.PathLike,
                *, workers: int = 4,
                exclude_projects: set[str] | None = None,
-               repo_delay: float = 0.0) -> BackupStats:
+               repo_delay: float = 0.0,
+               skip_repos: bool = False) -> BackupStats:
     out = ensure_dir(output_dir)
     stats = BackupStats()
     excluded = {name.strip().lower() for name in (exclude_projects or set())}
@@ -104,7 +105,7 @@ def backup_org(client: AzDoClient, output_dir: str | os.PathLike,
             backup_project(client, proj["name"],
                            projects_dir / safe_filename(proj["name"]),
                            stats=stats, workers=workers,
-                           repo_delay=repo_delay)
+                           repo_delay=repo_delay, skip_repos=skip_repos)
             stats.add("projects_backed_up")
         except AzDoAuthError:
             raise  # credentials are gone; every further call would fail too
@@ -117,7 +118,8 @@ def backup_org(client: AzDoClient, output_dir: str | os.PathLike,
 def backup_project(client: AzDoClient, project: str,
                    output_dir: str | os.PathLike,
                    stats: BackupStats | None = None,
-                   *, workers: int = 4, repo_delay: float = 0.0) -> BackupStats:
+                   *, workers: int = 4, repo_delay: float = 0.0,
+                   skip_repos: bool = False) -> BackupStats:
     out = ensure_dir(output_dir)
     stats = stats if stats is not None else BackupStats()
     log.info("Backing up project '%s' into %s", project, out)
@@ -129,6 +131,9 @@ def backup_project(client: AzDoClient, project: str,
         "org": client.org_name,
         "project": project,
         "backed_up_at_utc": datetime.now(timezone.utc).isoformat(),
+        # Archives are self-describing: a backup without repos must be
+        # distinguishable from one whose project simply has none.
+        "repos_included": not skip_repos,
     })
 
     vcs_type = ((proj_meta.get("capabilities") or {})
@@ -140,8 +145,14 @@ def backup_project(client: AzDoClient, project: str,
     _backup_classification_nodes(client, project, out, stats)
     _backup_work_items(client, project, out / "work_items", stats,
                        workers=workers)
-    _backup_repos(client, project, out / "repos", stats,
-                  repo_delay=repo_delay)
+    if skip_repos:
+        # Leave any previously backed-up mirrors untouched (no pruning):
+        # skipping repos this run must not degrade an existing backup dir.
+        log.info("[%s] git repositories skipped (--skip-repos)", project)
+        stats.add("repos_skipped_by_flag")
+    else:
+        _backup_repos(client, project, out / "repos", stats,
+                      repo_delay=repo_delay)
     _backup_test_plans(client, project, out / "test_plans", stats)
 
     _write_json(out / "summary.json", stats.as_dict())

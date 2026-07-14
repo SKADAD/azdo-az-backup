@@ -67,6 +67,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Seconds to pause between git clone/fetch operations "
                         "— git traffic counts toward the Azure DevOps "
                         "consumption limit too (default: 0).")
+    b.add_argument("--skip-repos", action="store_true",
+                   help="Exclude git repositories from the backup (work "
+                        "items/test plans only). Existing mirrors in the "
+                        "output directory are left untouched.")
 
     # restore
     r = sub.add_parser("restore", help="Restore a backed-up project (or a whole "
@@ -117,13 +121,15 @@ def _cmd_backup(client: AzDoClient, args: argparse.Namespace) -> int:
         excluded = {n for n in args.exclude_projects.split(",") if n.strip()}
         stats = backup_org(client, out, workers=args.workers,
                            exclude_projects=excluded,
-                           repo_delay=args.repo_delay)
+                           repo_delay=args.repo_delay,
+                           skip_repos=args.skip_repos)
     else:
         # Same layout as org backups so restore instructions are uniform.
         proj_dir = out / "projects" / safe_filename(args.project)
         stats = backup_project(client, args.project, proj_dir,
                                workers=args.workers,
-                               repo_delay=args.repo_delay)
+                               repo_delay=args.repo_delay,
+                               skip_repos=args.skip_repos)
     if args.archive or args.archive_path:
         from .verify import write_checksums
         write_checksums(out)

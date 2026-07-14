@@ -87,6 +87,13 @@ skips projects you don't want in the archive. Incremental re-runs prune
 work items, attachments and repo mirrors that were deleted in the org,
 so long-lived backup directories mirror the current state.
 
+`--skip-repos` excludes git repositories from the backup — useful when
+repos are actively cloned by developers anyway (so their loss risk is
+low) while work items and test plans exist only on the server. Git is
+included by default. A `--skip-repos` re-run leaves mirrors from earlier
+full backups untouched, and `manifest.json` records `repos_included` so
+archives stay self-describing.
+
 Add `--archive` to also produce a single self-contained `<output>.zip` —
 an offline artifact containing everything (work item JSON, attachment
 binaries, git mirrors, test plans) plus a sha256 manifest
