@@ -275,3 +275,34 @@ def test_resume_completes_pass2_after_crash(stub, archive, tmp_path, monkeypatch
     att = [p["value"] for p in state.relation_patches.get(gamma_bug, [])
            if p["value"].get("rel") == "AttachedFile"]
     assert len(att) == 1
+
+
+# ------------------------------------------------------------------ pruning
+
+
+def test_incremental_backup_prunes_deleted_items(stub, tmp_path):
+    """Orphaned work item files, attachment dirs and repo mirrors from
+    items deleted in the org must not survive into the next backup."""
+    _, base_url = stub
+    out = tmp_path / "prune"
+    args = ["backup", "--org", f"{base_url}/myorg", "--pat", "t",
+            "--project", "Alpha", "-o", str(out)]
+    assert cli.main(args) == 0
+
+    proj = out / "projects" / "Alpha"
+    orphan_wi = proj / "work_items" / "999.json"
+    orphan_wi.write_text("{}")
+    orphan_att = proj / "work_items" / "attachments" / "999"
+    orphan_att.mkdir()
+    (orphan_att / "old.bin").write_bytes(b"x")
+    orphan_repo = proj / "repos" / "gone.git"
+    orphan_repo.mkdir()
+    (orphan_repo / "HEAD").write_text("ref: refs/heads/main\n")
+
+    assert cli.main(args) == 0  # incremental re-run
+    assert not orphan_wi.exists()
+    assert not orphan_att.exists()
+    assert not orphan_repo.exists()
+    # The genuine content is untouched.
+    assert (proj / "work_items" / "1.json").exists()
+    assert (proj / "repos" / "web.git").is_dir()
